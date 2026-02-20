@@ -7,9 +7,9 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/stretchr/testify/require"
-	"github.com/emancu/pgdoctor/check"
-	"github.com/emancu/pgdoctor/checks/connectionhealth"
-	"github.com/emancu/pgdoctor/db"
+	"github.com/fresha/pgdoctor/check"
+	"github.com/fresha/pgdoctor/checks/connectionhealth"
+	"github.com/fresha/pgdoctor/db"
 )
 
 // mockQueries implements ConnectionHealthQueries for testing.

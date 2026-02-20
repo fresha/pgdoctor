@@ -8,9 +8,9 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/emancu/pgdoctor/check"
-	"github.com/emancu/pgdoctor/checks/indexbloat"
-	"github.com/emancu/pgdoctor/db"
+	"github.com/fresha/pgdoctor/check"
+	"github.com/fresha/pgdoctor/checks/indexbloat"
+	"github.com/fresha/pgdoctor/db"
 )
 
 type mockQueryer struct {

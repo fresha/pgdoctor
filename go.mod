@@ -1,4 +1,4 @@
-module github.com/emancu/pgdoctor
+module github.com/fresha/pgdoctor
 
 go 1.26.0
 

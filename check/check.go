@@ -4,7 +4,7 @@ package check
 import (
 	"context"
 
-	"github.com/emancu/pgdoctor/db"
+	"github.com/fresha/pgdoctor/db"
 )
 
 // DBTX re-exports the database connection interface for use by external consumers.

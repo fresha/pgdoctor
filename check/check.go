@@ -28,6 +28,7 @@ const (
 	CategoryVacuum      Category = "vacuum"
 	CategorySchema      Category = "schema"
 	CategoryPerformance Category = "performance"
+	CategoryPatterns    Category = "patterns"
 )
 
 type Checker interface {
@@ -119,10 +120,26 @@ type InstanceMetadata struct {
 	VCPUCores int     // Number of vCPU cores
 	MemoryGB  float64 // RAM in gigabytes
 
+	// High availability
+	MultiAZ          bool   // Multi-AZ / high availability deployment
+	AvailabilityZone string // Primary availability zone
+	SecondaryAZ      string // Secondary AZ (if Multi-AZ)
+
 	// Storage configuration
-	StorageType string // Storage type (e.g., "gp3", "io2", "ssd", "standard")
-	StorageGB   int    // Allocated storage in GB
-	StorageIOPS int    // Provisioned IOPS (0 if not applicable)
+	StorageType           string // Storage type (e.g., "gp3", "io2", "ssd", "standard")
+	StorageGB             int    // Allocated storage in GB
+	StorageIOPS           int    // Provisioned IOPS (0 if not applicable)
+	StorageAutoscaling    bool   // Storage autoscaling enabled
+	MaxStorageThresholdGB int    // Maximum storage limit for autoscaling (0 if no limit)
+	StorageEncrypted      bool   // Storage encryption at rest enabled
+
+	// Network security
+	PubliclyAccessible bool // Database is publicly accessible from internet
+
+	// Protection and maintenance
+	DeletionProtection      bool // Deletion protection enabled
+	BackupRetentionDays     int  // Number of days backups are retained (0 = disabled)
+	AutoMinorVersionUpgrade bool // Automatic minor version upgrades enabled
 
 	// Engine version (parsed at creation time)
 	EngineVersion      string // PostgreSQL version string (e.g., "15.4")

@@ -1,291 +1,233 @@
-# pgdoctor - The opinionated check-up your database deserves
+<p align="center">
+  <img src="logo.png" alt="pgdoctor logo" width="200" />
+</p>
 
-A command-line tool written in Rust to detect and diagnose the health of PostgreSQL databases.
+# pgdoctor
 
-## Features
-
-- **Modular Check System**: Each check is isolated and testable
-- **Categorized Checks**: Checks are organized into categories (performance, storage, indexes, settings, architecture)
-- **Flexible Filtering**: Include/exclude specific checks or filter by category
-- **Status-based Results**: Each check returns OK, WARN, or CRITICAL status
-- **Exit Codes**: Returns appropriate exit codes for CI/CD integration (0=OK, 1=WARN, 2=CRITICAL)
+A command-line tool and Go library for running health checks against PostgreSQL databases. It identifies misconfigurations, performance issues, and areas for optimization through 27 read-only checks that are safe to run against production.
 
 ## Installation
 
-```bash
-cargo build --release
-```
+### Pre-built binaries
 
-The binary will be available at `target/release/pgdoctor`.
+Download from [GitHub Releases](https://github.com/emancu/pgdoctor/releases).
 
-## Usage
-
-Basic usage:
+### Go install
 
 ```bash
-pgdoctor --connection "postgresql://user:password@localhost/dbname"
+go install github.com/emancu/pgdoctor/cmd/pgdoctor@latest
 ```
 
-### Connection String Format
-
-The connection string follows the PostgreSQL URI format:
-
-```
-postgresql://[user[:password]@][host][:port][/dbname][?param1=value1&...]
-```
-
-Examples:
-- `postgresql://postgres:password@localhost/mydb`
-- `postgresql://user@localhost:5432/production`
-- `postgresql://user:pass@db.example.com/analytics?sslmode=require`
-
-### Filtering Checks
-
-Include only specific checks:
+### Build from source
 
 ```bash
-pgdoctor --connection "postgresql://..." --include pg_version,table_sizes
+git clone https://github.com/emancu/pgdoctor.git
+cd pgdoctor
+go build -o pgdoctor ./cmd/pgdoctor
 ```
 
-Exclude specific checks:
+## Quick Start
 
 ```bash
-pgdoctor --connection "postgresql://..." --exclude table_sizes
+# Run all checks
+pgdoctor run "postgres://user:pass@localhost:5432/mydb"
+
+# Or use an environment variable
+export PGDOCTOR_DSN="postgres://user:pass@localhost:5432/mydb"
+pgdoctor run
+
+# Run only specific checks
+pgdoctor run "postgres://..." --only connection-health,indexes
+
+# Triage preset (incident-relevant checks only)
+pgdoctor run "postgres://..." --preset triage
+
+# Show details for failures and warnings
+pgdoctor run "postgres://..." --detail brief
+
+# JSON output for CI/CD integration
+pgdoctor run "postgres://..." --output json
+
+# List all available checks
+pgdoctor list
+
+# Get detailed documentation for a check
+pgdoctor explain index-bloat
 ```
 
-Filter by category:
+## Commands
+
+### `pgdoctor run <DSN>`
+
+Run health checks against a PostgreSQL database. The DSN can be passed as a positional argument or via the `PGDOCTOR_DSN` environment variable.
+
+| Flag | Description |
+|------|-------------|
+| `--only` | Only run these checks or categories |
+| `--ignore` | Skip these checks or categories |
+| `--preset` | Check preset: `all` (default), `triage` |
+| `--detail` | Detail level: `summary`, `brief`, `verbose`, `debug` |
+| `--output` | Output format: `text` (default), `json` |
+| `--hide-passing` | Hide passing checks |
+
+Exit codes: `0` = all checks pass, `1` = failures found, `2` = connection error.
+
+### `pgdoctor list`
+
+List all available checks organized by category.
+
+### `pgdoctor explain <check-id>`
+
+Show detailed documentation for a specific check, including what it checks, why it matters, and how to fix issues.
+
+Use `--sql-only` to display just the SQL query used by the check.
+
+### `pgdoctor completion`
+
+Generate shell completion scripts for bash, zsh, fish, or powershell:
 
 ```bash
-pgdoctor --connection "postgresql://..." --categories storage,settings
+pgdoctor completion zsh > "${fpath[1]}/_pgdoctor"
+pgdoctor completion bash > /etc/bash_completion.d/pgdoctor
 ```
+
+### Global Flags
+
+| Flag | Description |
+|------|-------------|
+| `--no-color` | Disable colored output |
+| `--no-colour` | Alias for `--no-color` |
+| `-v`, `--version` | Print version |
 
 ## Available Checks
 
-### 1. PostgreSQL Version Check
-- **ID**: `pg_version`
-- **Category**: `settings`
-- **Description**: Checks the PostgreSQL version and warns about unsupported versions
+### configs
+| Check | Description |
+|-------|-------------|
+| `pg-version` | PostgreSQL version support status |
+| `session-settings` | Role-level timeout and logging configurations |
+| `vacuum-settings` | Autovacuum, maintenance memory, and vacuum cost settings |
+| `replication-slots` | Replication slot configuration and health |
+| `connection-health` | Connection pool saturation, idle ratios, stuck transactions |
+| `connection-efficiency` | Session statistics for connection pool efficiency (PG 14+) |
+| `replication-lag` | Active replication stream lag |
+| `temp-usage` | Temporary file creation indicating `work_mem` exhaustion |
+| `statistics-freshness` | Statistics maturity for usage-based analysis |
 
-**Validations**:
-- CRITICAL: Version < 10 (end-of-life)
-- WARN: Version < 12 (approaching end-of-life)
-- OK: Version >= 12
+### indexes
+| Check | Description |
+|-------|-------------|
+| `invalid-indexes` | Indexes in invalid state needing rebuild |
+| `duplicate-indexes` | Exact and prefix duplicate indexes |
+| `index-usage` | Unused and inefficient indexes |
+| `dev-indexes` | Temporary development indexes |
+| `index-bloat` | B-tree index bloat estimates |
 
-[Full documentation](src/checks/version/README.md)
+### vacuum
+| Check | Description |
+|-------|-------------|
+| `freeze-age` | Transaction ID age approaching wraparound |
+| `table-bloat` | Dead tuple percentages indicating vacuum issues |
+| `table-vacuum-health` | Per-table autovacuum configuration and activity |
 
-### 2. Table Sizes Check
-- **ID**: `table_sizes`
-- **Category**: `storage`
-- **Description**: Analyzes all tables in the database and their sizes
+### schema
+| Check | Description |
+|-------|-------------|
+| `pk-types` | Primary keys using bigint or UUID for growth capacity |
+| `uuid-types` | UUID columns using native `uuid` type vs varchar/text |
+| `uuid-defaults` | UUID columns using v4 random defaults (B-tree bloat) |
+| `sequence-health` | Sequences approaching exhaustion |
+| `toast-storage` | TOAST storage usage optimization |
+| `partitioning` | Large/transient tables needing partitioning |
 
-**Validations**:
-- Reports total database size
-- WARN: Tables > 10 GB
-- CRITICAL: Tables > 50 GB
+### performance
+| Check | Description |
+|-------|-------------|
+| `cache-efficiency` | Buffer cache hit ratio |
+| `table-seq-scans` | Tables with excessive sequential scans |
+| `partition-usage` | Queries not using partition keys |
+| `table-activity` | Table write activity and HOT update efficiency |
 
-[Full documentation](src/checks/table_sizes/README.md)
+## Using as a Library
 
-### 3. Vacuum Settings Check
-- **ID**: `vacuum_settings`
-- **Category**: `performance`
-- **Description**: Validates PostgreSQL vacuum and memory configuration settings
+pgdoctor can be used as a Go library in your own tools:
 
-**Validations**:
-- Autovacuum scale factors (analyze and vacuum)
-- Autovacuum max workers
-- Maintenance work memory
-- Vacuum cost settings (delay and limit)
-- Work memory
+```go
+package main
 
-[Full documentation](src/checks/vacuum_settings/README.md)
+import (
+    "context"
+    "fmt"
+
+    "github.com/emancu/pgdoctor"
+    "github.com/jackc/pgx/v5"
+)
+
+func main() {
+    ctx := context.Background()
+    conn, _ := pgx.Connect(ctx, "postgres://localhost:5432/mydb")
+    defer conn.Close(ctx)
+
+    reports, err := pgdoctor.Run(ctx, conn, pgdoctor.AllChecks(), nil, nil)
+    if err != nil {
+        panic(err)
+    }
+
+    for _, report := range reports {
+        fmt.Printf("[%s] %s\n", report.CheckID, report.Name)
+    }
+}
+```
+
+### Key API
+
+```go
+// Run checks (pass AllChecks() for built-in set, or append your own)
+pgdoctor.Run(ctx, conn, checks, only, ignored) ([]*check.Report, error)
+
+// List all built-in checks
+pgdoctor.AllChecks() []check.CheckPackage
+
+// Validate filter strings against a check set
+pgdoctor.ValidateFilters(checks, filters) (valid, invalid []string)
+```
+
+The `db.DBTX` interface matches `pgx.Conn`, so pgdoctor works with any pgx-compatible connection.
 
 ## Architecture
 
-The codebase is organized for extensibility and maintainability. Each check is self-contained in its own directory with all related files:
+Each check is a self-contained Go package under `checks/`:
 
 ```
-src/
-├── main.rs              # Entry point and check orchestration
-├── cli.rs               # Command-line argument parsing
-├── db.rs                # Database connection handling
-├── output.rs            # Result formatting and display
-└── checks/
-    ├── mod.rs           # Check trait and common types
-    ├── version/
-    │   ├── mod.rs       # Module exports
-    │   ├── check.rs     # Implementation
-    │   ├── query.sql    # SQL query
-    │   ├── tests.rs     # Unit tests
-    │   └── README.md    # Check documentation
-    ├── table_sizes/
-    │   ├── mod.rs
-    │   ├── check.rs
-    │   ├── query.sql
-    │   ├── tests.rs
-    │   └── README.md
-    └── vacuum_settings/
-        ├── mod.rs
-        ├── check.rs
-        ├── query.sql
-        ├── tests.rs
-        └── README.md
+checks/indexbloat/
+├── check.go      # Check logic
+├── check_test.go # Unit tests
+├── query.sql     # SQL query (embedded via go:embed)
+└── README.md     # Documentation (embedded via go:embed)
 ```
 
-### Check Structure
+Checks implement the `check.Checker` interface:
 
-Each check follows a consistent structure:
-
-1. **check.rs** - Implementation of the check logic and validations
-2. **query.sql** - Single SQL query that extracts data from PostgreSQL
-3. **tests.rs** - Unit tests for the check logic
-4. **README.md** - Detailed documentation, troubleshooting guides, and references
-
-This structure ensures:
-- **Isolation**: Each check is self-contained and easy to understand
-- **Testability**: Clear separation between SQL queries and validation logic
-- **Documentation**: Every check has comprehensive documentation
-- **Maintainability**: Easy to add, modify, or remove checks
-- **Collaboration**: Multiple developers can work on different checks without conflicts
-
-### Adding New Checks
-
-To add a new check:
-
-1. Create a new directory in `src/checks/` (e.g., `my_check/`)
-
-2. Create `query.sql` with your SQL query:
-```sql
-SELECT column1, column2 FROM pg_table WHERE condition;
-```
-
-3. Create `check.rs` with the implementation:
-```rust
-use crate::checks::{Check, CheckCategory, CheckResult, CheckStatus, ValidationResult};
-use anyhow::{Context, Result};
-use async_trait::async_trait;
-use tokio_postgres::Client;
-
-pub struct MyCheck;
-
-impl MyCheck {
-    pub fn new() -> Self {
-        Self
-    }
-
-    fn validate_data(&self, data: Vec<String>) -> Vec<ValidationResult> {
-        // Your validation logic here
-        vec![ValidationResult {
-            name: "my_validation".to_string(),
-            status: CheckStatus::Ok,
-            message: "Everything looks good!".to_string(),
-        }]
-    }
-}
-
-#[async_trait]
-impl Check for MyCheck {
-    fn id(&self) -> &str {
-        "my_check"
-    }
-
-    fn name(&self) -> &str {
-        "My Check"
-    }
-
-    fn category(&self) -> CheckCategory {
-        CheckCategory::Performance
-    }
-
-    async fn run(&self, client: &Client) -> Result<CheckResult> {
-        let query = include_str!("query.sql");
-
-        let rows = client.query(query, &[]).await
-            .context("Failed to query data")?;
-
-        // Process rows and validate
-        let data: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
-        let validations = self.validate_data(data);
-
-        Ok(CheckResult {
-            check_id: self.id().to_string(),
-            check_name: self.name().to_string(),
-            category: self.category(),
-            validations,
-        })
-    }
+```go
+type Checker interface {
+    Metadata() CheckMetadata
+    Check(context.Context) (*Report, error)
 }
 ```
 
-4. Create `tests.rs` with unit tests:
-```rust
-#[cfg(test)]
-mod tests {
-    use super::super::check::MyCheck;
-    use crate::checks::CheckStatus;
+All SQL queries are read-only and use PostgreSQL system catalogs (`pg_stat_*`, `pg_catalog`). No data is modified.
 
-    #[test]
-    fn test_validate_data() {
-        let check = MyCheck::new();
-        let data = vec!["test".to_string()];
-        let validations = check.validate_data(data);
+## Contributing
 
-        assert_eq!(validations.len(), 1);
-        assert_eq!(validations[0].status, CheckStatus::Ok);
-    }
-}
-```
+Contributions are welcome! To add a new check:
 
-5. Create `mod.rs`:
-```rust
-mod check;
-#[cfg(test)]
-mod tests;
-
-pub use check::MyCheck;
-```
-
-6. Create `README.md` with documentation (see existing checks for examples)
-
-7. Add the module to `src/checks/mod.rs`:
-```rust
-pub mod my_check;
-```
-
-8. Register the check in `src/main.rs`:
-```rust
-let all_checks: Vec<Box<dyn Check>> = vec![
-    Box::new(VersionCheck::new()),
-    Box::new(TableSizesCheck::new()),
-    Box::new(VacuumSettingsCheck::new()),
-    Box::new(MyCheck::new()),  // Add your check here
-];
-```
-
-## Testing
-
-Each check receives an open database connection, making it easy to test with different database states:
-
-```rust
-#[tokio::test]
-async fn test_my_check() {
-    let client = connect_to_test_db().await.unwrap();
-    let check = MyCheck::new();
-    let result = check.run(&client).await.unwrap();
-
-    assert_eq!(result.overall_status(), CheckStatus::Ok);
-}
-```
-
-## Exit Codes
-
-- `0`: All checks passed (OK)
-- `1`: At least one check returned WARN
-- `2`: At least one check returned CRITICAL
+1. Create a new directory under `checks/`
+2. Implement `check.go` with `Metadata()` and `New()` functions
+3. Write the SQL query in `query.sql`
+4. Add tests in `check_test.go`
+5. Document the check in `README.md`
+6. Run `go generate ./...` to register the check
 
 ## License
 
 MIT
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.

@@ -7,6 +7,11 @@ import (
 	"github.com/emancu/pgdoctor/db"
 )
 
+// DBTX re-exports the database connection interface for use by external consumers.
+// This allows contrib checks from other packages to reference the same interface
+// without importing the db package directly.
+type DBTX = db.DBTX
+
 type Severity int
 
 const (
@@ -35,7 +40,7 @@ type Checker interface {
 // can use to either get metadata or instantiate checkers.
 type CheckPackage struct {
 	Metadata func() CheckMetadata
-	New      func(*db.Queries) Checker
+	New      func(db.DBTX) Checker
 }
 
 type CheckMetadata struct {

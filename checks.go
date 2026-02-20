@@ -36,169 +36,169 @@ import (
 )
 
 // AllChecks returns all available check packages.
-// Consumers call .Metadata() for check information or .New(queries) to instantiate checkers.
+// Consumers call .Metadata() for check information or .New(conn) to instantiate checkers.
 func AllChecks() []check.CheckPackage {
 	return []check.CheckPackage{
 		{
 			Metadata: cacheefficiency.Metadata,
-			New: func(q *db.Queries) check.Checker {
-				return cacheefficiency.New(q)
+			New: func(conn db.DBTX) check.Checker {
+				return cacheefficiency.New(db.New(conn))
 			},
 		},
 		{
 			Metadata: connectionefficiency.Metadata,
-			New: func(q *db.Queries) check.Checker {
-				return connectionefficiency.New(q)
+			New: func(conn db.DBTX) check.Checker {
+				return connectionefficiency.New(db.New(conn))
 			},
 		},
 		{
 			Metadata: connectionhealth.Metadata,
-			New: func(q *db.Queries) check.Checker {
-				return connectionhealth.New(q)
+			New: func(conn db.DBTX) check.Checker {
+				return connectionhealth.New(db.New(conn))
 			},
 		},
 		{
 			Metadata: devindexes.Metadata,
-			New: func(q *db.Queries) check.Checker {
-				return devindexes.New(q)
+			New: func(conn db.DBTX) check.Checker {
+				return devindexes.New(db.New(conn))
 			},
 		},
 		{
 			Metadata: duplicateindexes.Metadata,
-			New: func(q *db.Queries) check.Checker {
-				return duplicateindexes.New(q)
+			New: func(conn db.DBTX) check.Checker {
+				return duplicateindexes.New(db.New(conn))
 			},
 		},
 		{
 			Metadata: freezeage.Metadata,
-			New: func(q *db.Queries) check.Checker {
-				return freezeage.New(q)
+			New: func(conn db.DBTX) check.Checker {
+				return freezeage.New(db.New(conn))
 			},
 		},
 		{
 			Metadata: indexbloat.Metadata,
-			New: func(q *db.Queries) check.Checker {
-				return indexbloat.New(q)
+			New: func(conn db.DBTX) check.Checker {
+				return indexbloat.New(db.New(conn))
 			},
 		},
 		{
 			Metadata: indexusage.Metadata,
-			New: func(q *db.Queries) check.Checker {
-				return indexusage.New(q)
+			New: func(conn db.DBTX) check.Checker {
+				return indexusage.New(db.New(conn))
 			},
 		},
 		{
 			Metadata: invalidindexes.Metadata,
-			New: func(q *db.Queries) check.Checker {
-				return invalidindexes.New(q)
+			New: func(conn db.DBTX) check.Checker {
+				return invalidindexes.New(db.New(conn))
 			},
 		},
 		{
 			Metadata: partitioning.Metadata,
-			New: func(q *db.Queries) check.Checker {
-				return partitioning.New(q)
+			New: func(conn db.DBTX) check.Checker {
+				return partitioning.New(db.New(conn))
 			},
 		},
 		{
 			Metadata: partitionusage.Metadata,
-			New: func(q *db.Queries) check.Checker {
-				return partitionusage.New(q)
+			New: func(conn db.DBTX) check.Checker {
+				return partitionusage.New(db.New(conn))
 			},
 		},
 		{
 			Metadata: pgversion.Metadata,
-			New: func(q *db.Queries) check.Checker {
-				return pgversion.New(q)
+			New: func(conn db.DBTX) check.Checker {
+				return pgversion.New(db.New(conn))
 			},
 		},
 		{
 			Metadata: pktypes.Metadata,
-			New: func(q *db.Queries) check.Checker {
-				return pktypes.New(q)
+			New: func(conn db.DBTX) check.Checker {
+				return pktypes.New(db.New(conn))
 			},
 		},
 		{
 			Metadata: replicationlag.Metadata,
-			New: func(q *db.Queries) check.Checker {
-				return replicationlag.New(q)
+			New: func(conn db.DBTX) check.Checker {
+				return replicationlag.New(db.New(conn))
 			},
 		},
 		{
 			Metadata: replicationslots.Metadata,
-			New: func(q *db.Queries) check.Checker {
-				return replicationslots.New(q)
+			New: func(conn db.DBTX) check.Checker {
+				return replicationslots.New(db.New(conn))
 			},
 		},
 		{
 			Metadata: sequencehealth.Metadata,
-			New: func(q *db.Queries) check.Checker {
-				return sequencehealth.New(q)
+			New: func(conn db.DBTX) check.Checker {
+				return sequencehealth.New(db.New(conn))
 			},
 		},
 		{
 			Metadata: sessionsettings.Metadata,
-			New: func(q *db.Queries) check.Checker {
-				return sessionsettings.New(q)
+			New: func(conn db.DBTX) check.Checker {
+				return sessionsettings.New(db.New(conn))
 			},
 		},
 		{
 			Metadata: statisticsfreshness.Metadata,
-			New: func(q *db.Queries) check.Checker {
-				return statisticsfreshness.New(q)
+			New: func(conn db.DBTX) check.Checker {
+				return statisticsfreshness.New(db.New(conn))
 			},
 		},
 		{
 			Metadata: tableactivity.Metadata,
-			New: func(q *db.Queries) check.Checker {
-				return tableactivity.New(q)
+			New: func(conn db.DBTX) check.Checker {
+				return tableactivity.New(db.New(conn))
 			},
 		},
 		{
 			Metadata: tablebloat.Metadata,
-			New: func(q *db.Queries) check.Checker {
-				return tablebloat.New(q)
+			New: func(conn db.DBTX) check.Checker {
+				return tablebloat.New(db.New(conn))
 			},
 		},
 		{
 			Metadata: tableseqscans.Metadata,
-			New: func(q *db.Queries) check.Checker {
-				return tableseqscans.New(q)
+			New: func(conn db.DBTX) check.Checker {
+				return tableseqscans.New(db.New(conn))
 			},
 		},
 		{
 			Metadata: tablevacuumhealth.Metadata,
-			New: func(q *db.Queries) check.Checker {
-				return tablevacuumhealth.New(q)
+			New: func(conn db.DBTX) check.Checker {
+				return tablevacuumhealth.New(db.New(conn))
 			},
 		},
 		{
 			Metadata: tempusage.Metadata,
-			New: func(q *db.Queries) check.Checker {
-				return tempusage.New(q)
+			New: func(conn db.DBTX) check.Checker {
+				return tempusage.New(db.New(conn))
 			},
 		},
 		{
 			Metadata: toaststorage.Metadata,
-			New: func(q *db.Queries) check.Checker {
-				return toaststorage.New(q)
+			New: func(conn db.DBTX) check.Checker {
+				return toaststorage.New(db.New(conn))
 			},
 		},
 		{
 			Metadata: uuiddefaults.Metadata,
-			New: func(q *db.Queries) check.Checker {
-				return uuiddefaults.New(q)
+			New: func(conn db.DBTX) check.Checker {
+				return uuiddefaults.New(db.New(conn))
 			},
 		},
 		{
 			Metadata: uuidtypes.Metadata,
-			New: func(q *db.Queries) check.Checker {
-				return uuidtypes.New(q)
+			New: func(conn db.DBTX) check.Checker {
+				return uuidtypes.New(db.New(conn))
 			},
 		},
 		{
 			Metadata: vacuumsettings.Metadata,
-			New: func(q *db.Queries) check.Checker {
-				return vacuumsettings.New(q)
+			New: func(conn db.DBTX) check.Checker {
+				return vacuumsettings.New(db.New(conn))
 			},
 		},
 	}

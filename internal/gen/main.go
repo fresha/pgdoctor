@@ -187,14 +187,14 @@ import (
 )
 
 // AllChecks returns all available check packages.
-// Consumers call .Metadata() for check information or .New(queries) to instantiate checkers.
+// Consumers call .Metadata() for check information or .New(conn) to instantiate checkers.
 func AllChecks() []check.CheckPackage {
 	return []check.CheckPackage{
 {{- range .Checks }}
 		{
 			Metadata: {{ .PackageName }}.Metadata,
-			New: func(q *db.Queries) check.Checker {
-				return {{ .PackageName }}.New(q)
+			New: func(conn db.DBTX) check.Checker {
+				return {{ .PackageName }}.New(db.New(conn))
 			},
 		},
 {{- end }}

@@ -28,13 +28,11 @@ func Run(ctx context.Context, conn db.DBTX, checks []check.CheckPackage, only, i
 		onlyMap[o] = struct{}{}
 	}
 
-	queries := db.New(conn)
-
 	var allReports []*check.Report
 
 	for _, pkg := range checks {
 		// Instantiate the checker for this check
-		checker := pkg.New(queries)
+		checker := pkg.New(conn)
 		if !shouldRunCheck(checker, onlyMap, ignoredMap) {
 			continue
 		}

@@ -13,7 +13,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/emancu/pgdoctor"
+	"github.com/fresha/pgdoctor"
 )
 
 type checkEntry struct {

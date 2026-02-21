@@ -8,7 +8,6 @@ import (
 	"github.com/fresha/pgdoctor/checks/cacheefficiency"
 	"github.com/fresha/pgdoctor/checks/connectionefficiency"
 	"github.com/fresha/pgdoctor/checks/connectionhealth"
-	"github.com/fresha/pgdoctor/checks/devindexes"
 	"github.com/fresha/pgdoctor/checks/duplicateindexes"
 	"github.com/fresha/pgdoctor/checks/freezeage"
 	"github.com/fresha/pgdoctor/checks/indexbloat"
@@ -55,12 +54,6 @@ func AllChecks() []check.CheckPackage {
 			Metadata: connectionhealth.Metadata,
 			New: func(conn db.DBTX) check.Checker {
 				return connectionhealth.New(db.New(conn))
-			},
-		},
-		{
-			Metadata: devindexes.Metadata,
-			New: func(conn db.DBTX) check.Checker {
-				return devindexes.New(db.New(conn))
 			},
 		},
 		{

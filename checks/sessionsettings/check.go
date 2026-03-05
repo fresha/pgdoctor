@@ -35,8 +35,10 @@ type settingCheck struct {
 }
 
 type checker struct {
-	queryer SessionSettingsQueries
-	roles   []string
+	queryer     SessionSettingsQueries
+	roles       []string
+	timeoutWarn int64 // default: 5000
+	timeoutFail int64 // default: 10000
 }
 
 func Metadata() check.Metadata {
@@ -51,11 +53,25 @@ func Metadata() check.Metadata {
 }
 
 func New(queryer SessionSettingsQueries, cfg ...check.Config) check.Checker {
-	c := &checker{queryer: queryer}
+	c := &checker{
+		queryer:     queryer,
+		timeoutWarn: 5000,
+		timeoutFail: 10000,
+	}
 	if len(cfg) > 0 && cfg[0] != nil {
 		if myCfg, ok := cfg[0][Metadata().CheckID]; ok {
 			if roles, ok := myCfg["roles"]; ok {
 				c.roles = strings.Split(roles, ",")
+			}
+			if v, ok := myCfg["timeout_warn"]; ok {
+				if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+					c.timeoutWarn = n
+				}
+			}
+			if v, ok := myCfg["timeout_fail"]; ok {
+				if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+					c.timeoutFail = n
+				}
 			}
 		}
 	}
@@ -108,7 +124,7 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 			continue
 		}
 
-		timeouts, err := checkUserTimeouts(dbSettings, role)
+		timeouts, err := c.checkUserTimeouts(dbSettings, role)
 		if err != nil {
 			return nil, fmt.Errorf("checking timeouts for %s: %w", role, err)
 		}
@@ -165,7 +181,7 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 	return report, nil
 }
 
-func checkUserTimeouts(s dbSessionSettings, user string) ([]settingCheck, error) {
+func (c *checker) checkUserTimeouts(s dbSessionSettings, user string) ([]settingCheck, error) {
 	var checks []settingCheck
 
 	stmtTimeout, err := s.fetch(user, "statement_timeout")
@@ -184,30 +200,31 @@ func checkUserTimeouts(s dbSessionSettings, user string) ([]settingCheck, error)
 	}
 
 	// Check statement_timeout
+	expectedTimeout := fmt.Sprintf("≤ %dms", c.timeoutWarn)
 	if stmtTimeout == 0 {
 		checks = append(checks, settingCheck{
 			Role:      user,
 			Parameter: "statement_timeout",
 			Current:   "0ms (disabled)",
-			Expected:  "500-5000ms",
+			Expected:  expectedTimeout,
 			Status:    "MUST be set",
 			Severity:  check.SeverityFail,
 		})
-	} else if stmtTimeout > 10000 {
+	} else if stmtTimeout > c.timeoutFail {
 		checks = append(checks, settingCheck{
 			Role:      user,
 			Parameter: "statement_timeout",
 			Current:   fmt.Sprintf("%dms", stmtTimeout),
-			Expected:  "500-5000ms",
+			Expected:  expectedTimeout,
 			Status:    "Too high",
 			Severity:  check.SeverityFail,
 		})
-	} else if stmtTimeout > 5000 {
+	} else if stmtTimeout > c.timeoutWarn {
 		checks = append(checks, settingCheck{
 			Role:      user,
 			Parameter: "statement_timeout",
 			Current:   fmt.Sprintf("%dms", stmtTimeout),
-			Expected:  "500-5000ms",
+			Expected:  expectedTimeout,
 			Status:    "High",
 			Severity:  check.SeverityWarn,
 		})
@@ -216,7 +233,7 @@ func checkUserTimeouts(s dbSessionSettings, user string) ([]settingCheck, error)
 			Role:      user,
 			Parameter: "statement_timeout",
 			Current:   fmt.Sprintf("%dms", stmtTimeout),
-			Expected:  "500-5000ms",
+			Expected:  expectedTimeout,
 			Status:    "OK",
 			Severity:  check.SeverityOK,
 		})
@@ -249,25 +266,25 @@ func checkUserTimeouts(s dbSessionSettings, user string) ([]settingCheck, error)
 			Role:      user,
 			Parameter: "transaction_timeout",
 			Current:   "0ms (disabled)",
-			Expected:  "500-5000ms",
+			Expected:  expectedTimeout,
 			Status:    "MUST be set (PG17+)",
 			Severity:  check.SeverityFail,
 		})
-	} else if txTimeout > 10000 {
+	} else if txTimeout > c.timeoutFail {
 		checks = append(checks, settingCheck{
 			Role:      user,
 			Parameter: "transaction_timeout",
 			Current:   fmt.Sprintf("%dms", txTimeout),
-			Expected:  "500-5000ms",
+			Expected:  expectedTimeout,
 			Status:    "Too high",
 			Severity:  check.SeverityFail,
 		})
-	} else if txTimeout > 5000 {
+	} else if txTimeout > c.timeoutWarn {
 		checks = append(checks, settingCheck{
 			Role:      user,
 			Parameter: "transaction_timeout",
 			Current:   fmt.Sprintf("%dms", txTimeout),
-			Expected:  "500-5000ms",
+			Expected:  expectedTimeout,
 			Status:    "High",
 			Severity:  check.SeverityWarn,
 		})
@@ -276,7 +293,7 @@ func checkUserTimeouts(s dbSessionSettings, user string) ([]settingCheck, error)
 			Role:      user,
 			Parameter: "transaction_timeout",
 			Current:   fmt.Sprintf("%dms", txTimeout),
-			Expected:  "500-5000ms",
+			Expected:  expectedTimeout,
 			Status:    "OK",
 			Severity:  check.SeverityOK,
 		})

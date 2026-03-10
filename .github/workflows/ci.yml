@@ -60,3 +60,27 @@ jobs:
         run: |
           go generate ./...
           git diff --exit-code
+
+      - name: Validate docs assets
+        run: |
+          # checks.json must be valid JSON
+          jq empty docs/checks.json
+
+          # Every check in the manifest must have a matching markdown file
+          for id in $(jq -r '.checks[].id' docs/checks.json); do
+            if [ ! -f "docs/checks/${id}.md" ]; then
+              echo "::error::Missing docs/checks/${id}.md for check '${id}'"
+              exit 1
+            fi
+          done
+
+          # Required page assets must exist
+          for f in docs/index.html docs/logo.png docs/checks.json; do
+            if [ ! -f "$f" ]; then
+              echo "::error::Missing required asset: $f"
+              exit 1
+            fi
+          done
+
+          count=$(jq '.checks | length' docs/checks.json)
+          echo "✓ docs/ validated: ${count} checks, all assets present"

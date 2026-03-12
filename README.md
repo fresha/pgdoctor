@@ -1,6 +1,6 @@
-# pgdoctor
+<p align="center"><img src="logo.png" alt="pgdoctor logo" width="500"/></p>
 
-<img src="logo.png" alt="pgdoctor logo" width="180" align="left" />
+# `pgdoctor`
 
 A command-line tool and Go library for running health checks against PostgreSQL databases.
 It identifies misconfigurations, performance issues, and areas for optimization through

@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/emancu/pgdoctor/check"
-	"github.com/emancu/pgdoctor/db"
+	"github.com/fresha/pgdoctor/check"
+	"github.com/fresha/pgdoctor/db"
 )
 
 //go:embed query.sql

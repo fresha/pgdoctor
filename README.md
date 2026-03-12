@@ -12,18 +12,18 @@ read-only checks that are safe to run against production.
 
 ### Pre-built binaries
 
-Download from [GitHub Releases](https://github.com/emancu/pgdoctor/releases).
+Download from [GitHub Releases](https://github.com/fresha/pgdoctor/releases).
 
 ### Go install
 
 ```bash
-go install github.com/emancu/pgdoctor/cmd/pgdoctor@latest
+go install github.com/fresha/pgdoctor/cmd/pgdoctor@latest
 ```
 
 ### Build from source
 
 ```bash
-git clone https://github.com/emancu/pgdoctor.git
+git clone https://github.com/fresha/pgdoctor.git
 cd pgdoctor
 go build -o pgdoctor ./cmd/pgdoctor
 ```
@@ -154,7 +154,7 @@ import (
     "context"
     "fmt"
 
-    "github.com/emancu/pgdoctor"
+    "github.com/fresha/pgdoctor"
     "github.com/jackc/pgx/v5"
 )
 

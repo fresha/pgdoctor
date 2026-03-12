@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/emancu/pgdoctor/check"
-	"github.com/emancu/pgdoctor/checks/tablevacuumhealth"
-	"github.com/emancu/pgdoctor/db"
+	"github.com/fresha/pgdoctor/check"
+	"github.com/fresha/pgdoctor/checks/tablevacuumhealth"
+	"github.com/fresha/pgdoctor/db"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

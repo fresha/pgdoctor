@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/emancu/pgdoctor/check"
-	"github.com/emancu/pgdoctor/db"
+	"github.com/fresha/pgdoctor/check"
+	"github.com/fresha/pgdoctor/db"
 )
 
 const checkTimeout = 2 * time.Second

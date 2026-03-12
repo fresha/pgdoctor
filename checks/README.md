@@ -88,7 +88,7 @@ import (
     _ "embed"
     "fmt"
 
-    "github.com/emancu/pgdoctor/check"
+    "github.com/fresha/pgdoctor/check"
 )
 
 //go:embed query.sql

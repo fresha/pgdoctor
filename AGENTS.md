@@ -64,8 +64,8 @@ import (
     _ "embed"
     "fmt"
 
-    "github.com/emancu/pgdoctor/check"
-    "github.com/emancu/pgdoctor/db"
+    "github.com/fresha/pgdoctor/check"
+    "github.com/fresha/pgdoctor/db"
 )
 
 //go:embed query.sql
@@ -440,8 +440,8 @@ External consumers can extend pgdoctor with their own checks:
 
 ```go
 import (
-    pgdoctor "github.com/emancu/pgdoctor"
-    "github.com/emancu/pgdoctor/check"
+    pgdoctor "github.com/fresha/pgdoctor"
+    "github.com/fresha/pgdoctor/check"
 )
 
 // Combine built-in + custom checks

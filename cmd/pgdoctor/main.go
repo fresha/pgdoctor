@@ -7,7 +7,7 @@ import (
 	"os"
 	"runtime/debug"
 
-	"github.com/emancu/pgdoctor/internal/cli"
+	"github.com/fresha/pgdoctor/internal/cli"
 )
 
 func main() {

@@ -8,7 +8,7 @@ import (
 
 	"github.com/fatih/color"
 
-	"github.com/emancu/pgdoctor/check"
+	"github.com/fresha/pgdoctor/check"
 )
 
 func formatReport(w io.Writer, reports []*check.Report, opts *runOptions, dbLabel string) check.Severity {

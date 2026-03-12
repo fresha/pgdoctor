@@ -74,7 +74,7 @@ go test ./...                      # Full suite passes
 pgdoctor requires Go 1.22+ and a PostgreSQL instance for sqlc code generation.
 
 ```bash
-git clone https://github.com/emancu/pgdoctor.git
+git clone https://github.com/fresha/pgdoctor.git
 cd pgdoctor
 go build -o pgdoctor ./cmd/pgdoctor
 go test ./...

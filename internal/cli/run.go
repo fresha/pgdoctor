@@ -8,8 +8,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/spf13/cobra"
 
-	"github.com/emancu/pgdoctor"
-	"github.com/emancu/pgdoctor/check"
+	"github.com/fresha/pgdoctor"
+	"github.com/fresha/pgdoctor/check"
 )
 
 type detailLevel string

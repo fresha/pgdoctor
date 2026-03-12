@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/emancu/pgdoctor/check"
-	"github.com/emancu/pgdoctor/checks/uuidtypes"
-	"github.com/emancu/pgdoctor/db"
+	"github.com/fresha/pgdoctor/check"
+	"github.com/fresha/pgdoctor/checks/uuidtypes"
+	"github.com/fresha/pgdoctor/db"
 	"github.com/stretchr/testify/require"
 )
 

@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/emancu/pgdoctor/check"
+	"github.com/fresha/pgdoctor/check"
 )
 
 type jsonReport struct {

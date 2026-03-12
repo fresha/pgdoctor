@@ -7,8 +7,8 @@ import (
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
 
-	"github.com/emancu/pgdoctor"
-	"github.com/emancu/pgdoctor/check"
+	"github.com/fresha/pgdoctor"
+	"github.com/fresha/pgdoctor/check"
 )
 
 func newExplainCommand() *cobra.Command {

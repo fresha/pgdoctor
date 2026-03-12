@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/emancu/pgdoctor/check"
-	"github.com/emancu/pgdoctor/checks/invalidindexes"
-	"github.com/emancu/pgdoctor/db"
+	"github.com/fresha/pgdoctor/check"
+	"github.com/fresha/pgdoctor/checks/invalidindexes"
+	"github.com/fresha/pgdoctor/db"
 	"github.com/stretchr/testify/require"
 )
 

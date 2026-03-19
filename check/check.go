@@ -145,6 +145,24 @@ type InstanceMetadata struct {
 	EngineVersion      string // PostgreSQL version string (e.g., "15.4")
 	EngineVersionMajor int    // Major version (e.g., 15)
 	EngineVersionMinor int    // Minor version (e.g., 4)
+
+	// High availability
+	MultiAZ          bool
+	AvailabilityZone string
+	SecondaryAZ      string
+
+	// Storage autoscaling
+	StorageAutoscaling    bool
+	MaxStorageThresholdGB int
+
+	// Security
+	StorageEncrypted   bool
+	PubliclyAccessible bool
+
+	// Protection and maintenance
+	DeletionProtection      bool
+	BackupRetentionDays     int
+	AutoMinorVersionUpgrade bool
 }
 
 type instanceMetadataKey struct{}

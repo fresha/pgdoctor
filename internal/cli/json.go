@@ -42,7 +42,7 @@ func formatJSON(w io.Writer, reports []*check.Report) error {
 			CheckID:  report.CheckID,
 			Name:     report.Name,
 			Category: string(report.Category),
-			Severity: severityString(report.Severity),
+			Severity: report.Severity.String(),
 			Results:  make([]jsonFinding, 0, len(report.Results)),
 		}
 
@@ -50,7 +50,7 @@ func formatJSON(w io.Writer, reports []*check.Report) error {
 			jf := jsonFinding{
 				ID:       result.ID,
 				Name:     result.Name,
-				Severity: severityString(result.Severity),
+				Severity: result.Severity.String(),
 				Details:  result.Details,
 			}
 
@@ -62,7 +62,7 @@ func formatJSON(w io.Writer, reports []*check.Report) error {
 				for _, row := range result.Table.Rows {
 					jt.Rows = append(jt.Rows, jsonRow{
 						Cells:    row.Cells,
-						Severity: severityString(row.Severity),
+						Severity: row.Severity.String(),
 					})
 				}
 				jf.Table = jt
@@ -81,17 +81,4 @@ func formatJSON(w io.Writer, reports []*check.Report) error {
 	}
 
 	return nil
-}
-
-func severityString(s check.Severity) string {
-	switch s {
-	case check.SeverityOK:
-		return "pass"
-	case check.SeverityWarn:
-		return "warn"
-	case check.SeverityFail:
-		return "fail"
-	default:
-		return "unknown"
-	}
 }

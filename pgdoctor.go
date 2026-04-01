@@ -5,56 +5,116 @@ package pgdoctor
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strings"
 	"time"
 
 	"github.com/emancu/pgdoctor/check"
 	"github.com/emancu/pgdoctor/db"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
-const checkTimeout = 2 * time.Second
+// DefaultStatementTimeoutMs is the PostgreSQL statement_timeout in milliseconds.
+// Callers should SET this on the connection before calling Run().
+const DefaultStatementTimeoutMs = 2000
 
-// Run is the entrypoint to executing pgdoctor's checks.
-// Returns all check reports with their metadata and results.
-// Use AllChecks() for the built-in set, or append contrib checks for custom runs.
-func Run(ctx context.Context, conn db.DBTX, checks []check.Package, cfg check.Config, only, ignored []string) ([]*check.Report, error) {
-	ignoredMap := map[string]struct{}{}
-	for _, ignore := range ignored {
-		ignoredMap[ignore] = struct{}{}
+// ReportHandler is called once per check after it completes.
+type ReportHandler func(*check.Report)
+
+// Collect returns a ReportHandler that appends each report to the given slice.
+func Collect(reports *[]*check.Report) ReportHandler {
+	return func(r *check.Report) { *reports = append(*reports, r) }
+}
+
+// Options configures a pgdoctor run.
+type Options struct {
+	Checks   []check.Package
+	Config   check.Config
+	OnReport ReportHandler
+}
+
+// Run executes checks sequentially against the given connection.
+//
+// Important: callers should SET statement_timeout on the connection before calling Run()
+// to prevent slow queries from blocking the database. See DefaultStatementTimeoutMs.
+func Run(ctx context.Context, conn db.DBTX, opts Options) {
+	onReport := opts.OnReport
+	if onReport == nil {
+		onReport = func(*check.Report) {}
 	}
-	onlyMap := map[string]struct{}{}
-	for _, o := range only {
-		onlyMap[o] = struct{}{}
-	}
 
-	var allReports []*check.Report
+	for _, pkg := range opts.Checks {
+		checker := pkg.New(conn, opts.Config)
 
-	for _, pkg := range checks {
-		// Instantiate the checker for this check
-		checker := pkg.New(conn, cfg)
-		if !shouldRunCheck(checker, onlyMap, ignoredMap) {
-			continue
-		}
-
-		// Create timeout context for this check
-		checkCtx, cancel := context.WithTimeout(ctx, checkTimeout)
-		report, err := checker.Check(checkCtx)
-		cancel() // Release resources immediately
+		start := time.Now()
+		report, err := checker.Check(ctx)
+		elapsed := time.Since(start)
 
 		if err != nil {
 			metadata := checker.Metadata()
-			if errors.Is(err, context.DeadlineExceeded) {
-				return nil, fmt.Errorf("check %s/%s timed out after %s",
-					metadata.Category, metadata.CheckID, checkTimeout)
+			report = check.NewReport(metadata)
+			report.Severity = check.SeveritySkip
+
+			detail := err.Error()
+			if isStatementTimeout(err) {
+				detail = "query cancelled by statement_timeout"
 			}
-			return nil, err
+
+			report.AddFinding(check.Finding{
+				ID:       "error",
+				Name:     "Check Error",
+				Severity: check.SeveritySkip,
+				Details:  detail,
+			})
 		}
 
-		allReports = append(allReports, report)
+		report.Duration = elapsed
+		onReport(report)
+	}
+}
+
+// Filter returns checks matching the only/ignored filters.
+// If only is non-empty, only checks matching those check IDs or categories are included.
+// Checks matching ignored check IDs or categories are excluded.
+func Filter(checks []check.Package, only, ignored []string) []check.Package {
+	if len(only) == 0 && len(ignored) == 0 {
+		return checks
 	}
 
-	return allReports, nil
+	onlyMap := toSet(only)
+	ignoredMap := toSet(ignored)
+
+	var filtered []check.Package
+	for _, pkg := range checks {
+		metadata := pkg.Metadata()
+		checkID := metadata.CheckID
+		category := string(metadata.Category)
+
+		if len(onlyMap) > 0 {
+			if _, ok := onlyMap[checkID]; !ok {
+				if _, ok := onlyMap[category]; !ok {
+					continue
+				}
+			}
+		}
+
+		if _, ok := ignoredMap[checkID]; ok {
+			continue
+		}
+		if _, ok := ignoredMap[category]; ok {
+			continue
+		}
+
+		filtered = append(filtered, pkg)
+	}
+	return filtered
+}
+
+func toSet(items []string) map[string]struct{} {
+	m := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		m[item] = struct{}{}
+	}
+	return m
 }
 
 // ValidateFilters normalizes filter strings and validates them against available checks.
@@ -139,23 +199,8 @@ func AllFilters() []string {
 	return filters
 }
 
-func shouldRunCheck(checker check.Checker, only, ignored map[string]struct{}) bool {
-	metadata := checker.Metadata()
-
-	if len(only) > 0 {
-		_, categoryInOnly := only[string(metadata.Category)]
-		_, checkIDInOnly := only[metadata.CheckID]
-		if !categoryInOnly && !checkIDInOnly {
-			return false
-		}
-	}
-
-	if _, ignoredCategory := ignored[string(metadata.Category)]; ignoredCategory {
-		return false
-	}
-	if _, ignoredCheck := ignored[metadata.CheckID]; ignoredCheck {
-		return false
-	}
-
-	return true
+// isStatementTimeout checks if the error is a PostgreSQL statement_timeout (SQLSTATE 57014).
+func isStatementTimeout(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "57014"
 }

@@ -1,9 +1,15 @@
 package pgdoctor
 
 import (
+	"context"
+	"fmt"
 	"testing"
 
+	"github.com/fresha/pgdoctor/check"
+	"github.com/fresha/pgdoctor/db"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestValidateFilters(t *testing.T) {
@@ -75,4 +81,80 @@ func TestValidateFilters(t *testing.T) {
 			assert.ElementsMatch(t, tt.expectedInval, invalid, "invalid filters should match")
 		})
 	}
+}
+
+// fakeChecker is a test double that implements check.Checker.
+type fakeChecker struct {
+	metadata check.Metadata
+	report   *check.Report
+	err      error
+}
+
+func (f *fakeChecker) Metadata() check.Metadata { return f.metadata }
+
+func (f *fakeChecker) Check(_ context.Context) (*check.Report, error) {
+	return f.report, f.err
+}
+
+func fakePackage(id string, category check.Category, report *check.Report, err error) check.Package {
+	meta := check.Metadata{CheckID: id, Name: id, Category: category}
+	return check.Package{
+		Metadata: func() check.Metadata { return meta },
+		New: func(_ db.DBTX, _ check.Config) check.Checker {
+			return &fakeChecker{metadata: meta, report: report, err: err}
+		},
+	}
+}
+
+func TestRun_ContinuesAfterStatementTimeout(t *testing.T) {
+	t.Parallel()
+
+	// Simulate a PostgreSQL statement_timeout error (SQLSTATE 57014)
+	pgErr := &pgconn.PgError{Code: "57014", Message: "canceling statement due to statement timeout"}
+
+	fastReport := check.NewReport(check.Metadata{CheckID: "fast-check", Name: "Fast", Category: check.CategoryConfigs})
+	fastReport.AddFinding(check.Finding{ID: "ok", Name: "OK", Severity: check.SeverityOK, Details: "all good"})
+
+	var reports []*check.Report
+	Run(context.Background(), nil, Options{
+		Checks: []check.Package{
+			fakePackage("slow-check", check.CategoryConfigs, nil, pgErr),
+			fakePackage("fast-check", check.CategoryConfigs, fastReport, nil),
+		},
+		OnReport: Collect(&reports),
+	})
+	require.Len(t, reports, 2)
+
+	assert.Equal(t, check.SeveritySkip, reports[0].Severity)
+	assert.Equal(t, "slow-check", reports[0].CheckID)
+	require.Len(t, reports[0].Results, 1)
+	assert.Contains(t, reports[0].Results[0].Details, "statement_timeout")
+
+	assert.Equal(t, check.SeverityOK, reports[1].Severity)
+	assert.Equal(t, "fast-check", reports[1].CheckID)
+}
+
+func TestRun_ContinuesAfterCheckError(t *testing.T) {
+	t.Parallel()
+
+	goodReport := check.NewReport(check.Metadata{CheckID: "good-check", Name: "Good", Category: check.CategoryConfigs})
+	goodReport.AddFinding(check.Finding{ID: "ok", Name: "OK", Severity: check.SeverityOK})
+
+	var reports []*check.Report
+	Run(context.Background(), nil, Options{
+		Checks: []check.Package{
+			fakePackage("broken-check", check.CategoryConfigs, nil, fmt.Errorf("connection refused")),
+			fakePackage("good-check", check.CategoryConfigs, goodReport, nil),
+		},
+		OnReport: Collect(&reports),
+	})
+	require.Len(t, reports, 2)
+
+	assert.Equal(t, check.SeveritySkip, reports[0].Severity)
+	assert.Equal(t, "broken-check", reports[0].CheckID)
+	require.Len(t, reports[0].Results, 1)
+	assert.Contains(t, reports[0].Results[0].Details, "connection refused")
+
+	assert.Equal(t, check.SeverityOK, reports[1].Severity)
+	assert.Equal(t, "good-check", reports[1].CheckID)
 }

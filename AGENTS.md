@@ -152,8 +152,8 @@ Access metadata via promoted fields:
 The public API in `pgdoctor.go` accepts an explicit check list, enabling consumers to inject custom checks:
 
 ```go
-// Run checks against a database connection
-pgdoctor.Run(ctx, conn, checks, cfg, only, ignored) ([]*check.Report, error)
+// Run checks with the given options
+pgdoctor.Run(ctx, conn, pgdoctor.Options{...})
 
 // Get all built-in checks
 pgdoctor.AllChecks() []check.Package
@@ -287,11 +287,12 @@ Five categories:
 
 ### Severity
 
+- `check.SeveritySkip` - Check could not run (timeout, permission error)
 - `check.SeverityOK` - Check passed, no action needed
 - `check.SeverityWarn` - Issue found, non-urgent action
 - `check.SeverityFail` - Issue found, urgent action required
 
-Report severity is automatically the maximum across all findings.
+Report severity is automatically the maximum across all findings. `SeveritySkip` is ordered below `SeverityOK` so it doesn't affect severity comparisons.
 
 ## Common Tasks
 
@@ -444,9 +445,16 @@ import (
     "github.com/fresha/pgdoctor/check"
 )
 
-// Combine built-in + custom checks
+// Combine built-in + custom checks, then filter
 allChecks := append(pgdoctor.AllChecks(), myContribChecks()...)
-reports, _ := pgdoctor.Run(ctx, conn, allChecks, cfg, only, ignored)
+checks := pgdoctor.Filter(allChecks, only, ignored)
+
+var reports []*check.Report
+pgdoctor.Run(ctx, conn, pgdoctor.Options{
+    Checks:   checks,
+    Config:   cfg,
+    OnReport: pgdoctor.Collect(&reports),
+})
 ```
 
 Each contrib check creates its own sqlc queries internally, using the `check.DBTX` interface. This allows organizations to add domain-specific checks (naming conventions, internal standards) without forking.

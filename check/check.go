@@ -3,6 +3,7 @@ package check
 
 import (
 	"context"
+	"time"
 
 	"github.com/fresha/pgdoctor/db"
 )
@@ -15,7 +16,8 @@ type DBTX = db.DBTX
 type Severity int
 
 const (
-	SeverityOK Severity = iota
+	SeveritySkip Severity = iota - 1 // Check could not run (timeout, permission error, etc.)
+	SeverityOK   Severity = iota
 	SeverityWarn
 	SeverityFail
 )
@@ -23,11 +25,13 @@ const (
 func (s Severity) String() string {
 	switch s {
 	case SeverityOK:
-		return "ok"
+		return "pass"
 	case SeverityWarn:
 		return "warn"
 	case SeverityFail:
 		return "fail"
+	case SeveritySkip:
+		return "skip"
 	default:
 		return "unknown"
 	}
@@ -74,6 +78,7 @@ type Metadata struct {
 type Report struct {
 	Metadata // Embedded, promotes CheckID, Name, Category, Description, SQL
 	Severity Severity
+	Duration time.Duration
 	Results  []Finding
 }
 

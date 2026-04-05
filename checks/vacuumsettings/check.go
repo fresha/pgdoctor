@@ -51,28 +51,22 @@ func (c *checker) Metadata() check.Metadata {
 func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 	report := check.NewReport(Metadata())
 
-	meta := check.InstanceMetadataFromContext(ctx)
-	if meta == nil {
-		report.AddFinding(check.Finding{
-			ID:       report.CheckID,
-			Name:     report.Name,
-			Severity: check.SeverityWarn,
-			Details:  "Instance metadata not available - skipping RAM-aware vacuum settings checks",
-		})
-		return report, nil
-	}
-
 	settings, err := c.queryer.VacuumSettings(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("running %s/%s: %w", check.CategoryVacuum, report.CheckID, err)
 	}
 
 	dbSettings := dbVacuumSettings(settings)
+	meta := check.InstanceMetadataFromContext(ctx)
 
+	// These checks work without instance metadata
 	checkAutovacuumScaleFactors(dbSettings, report)
+	checkVacuumCostSettings(dbSettings, report)
+
+	// These checks degrade gracefully: critical misconfigs are always caught,
+	// but RAM-aware recommendations require instance metadata.
 	checkAutovacuumWorkers(dbSettings, report, meta)
 	checkMaintenanceWorkMem(dbSettings, report, meta)
-	checkVacuumCostSettings(dbSettings, report)
 	checkWorkMem(dbSettings, report, meta)
 
 	if len(report.Results) == 0 {
@@ -170,9 +164,8 @@ func checkAutovacuumWorkers(s dbVacuumSettings, report *check.Report, meta *chec
 		return
 	}
 
-	// Context-aware check for very large instances only
-	// Only flag when workers = 3 might genuinely be a bottleneck (≥32 vCPU)
-	if meta.VCPUCores >= 32 && workers == 3 {
+	// Context-aware check for very large instances only (requires metadata)
+	if meta != nil && meta.VCPUCores >= 32 && workers == 3 {
 		recommended := 6 // Conservative: fixed recommendation for very large instances
 
 		report.AddFinding(check.Finding{
@@ -217,8 +210,12 @@ func checkMaintenanceWorkMem(s dbVacuumSettings, report *check.Report, meta *che
 		return
 	}
 
-	// RAM-aware check: Total budget calculation
-	// CRITICAL: maintenance_work_mem × autovacuum_max_workers = total RAM used
+	// RAM-aware checks require instance metadata
+	if meta == nil {
+		return
+	}
+
+	// Total budget calculation: maintenance_work_mem × autovacuum_max_workers = total RAM used
 	availableRAMMB := int64(meta.MemoryGB * 1024)
 	totalBudgetMB := maintenanceMemMB * autovacuumMaxWorkers
 	budgetPercent := (float64(totalBudgetMB) / float64(availableRAMMB)) * 100
@@ -326,6 +323,11 @@ func checkWorkMem(s dbVacuumSettings, report *check.Report, meta *check.Instance
 				"Will cause excessive temporary file usage for sorts and hash operations.",
 				workMemMB),
 		})
+		return
+	}
+
+	// RAM-aware checks require instance metadata
+	if meta == nil {
 		return
 	}
 

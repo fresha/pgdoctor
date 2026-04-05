@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"sort"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/spf13/cobra"
@@ -68,6 +70,12 @@ the level of detail, and --hide-passing to only show failures and warnings.`,
 			}
 			defer conn.Close(ctx)
 
+			// Set statement_timeout so PostgreSQL kills individual slow queries.
+			if _, err := conn.Exec(ctx, fmt.Sprintf("SET statement_timeout = %d", pgdoctor.DefaultStatementTimeoutMs)); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: failed to set statement_timeout: %v\n", err)
+				return &SilentError{ExitCode: 2}
+			}
+
 			allChecks := pgdoctor.AllChecks()
 
 			// Apply preset filter
@@ -80,7 +88,7 @@ the level of detail, and --hide-passing to only show failures and warnings.`,
 				}
 			}
 
-			// Validate filters
+			// Validate and apply filters
 			validOnly, invalidOnly := pgdoctor.ValidateFilters(allChecks, opts.only)
 			validIgnored, invalidIgnored := pgdoctor.ValidateFilters(allChecks, opts.ignored)
 
@@ -97,16 +105,20 @@ the level of detail, and --hide-passing to only show failures and warnings.`,
 				return &SilentError{ExitCode: 1}
 			}
 
-			reports, err := pgdoctor.Run(ctx, conn, allChecks, nil, validOnly, validIgnored)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				return &SilentError{ExitCode: 1}
+			checks := pgdoctor.Filter(allChecks, validOnly, validIgnored)
+			sortChecksByCategory(checks)
+
+			runOpts := pgdoctor.Options{
+				Checks: checks,
 			}
 
-			// Format and print output
-			w := cmd.OutOrStdout()
-
+			// JSON output: batch collect then render
 			if opts.output == "json" {
+				var reports []*check.Report
+				runOpts.OnReport = pgdoctor.Collect(&reports)
+				pgdoctor.Run(ctx, conn, runOpts)
+
+				w := cmd.OutOrStdout()
 				if err := formatJSON(w, reports); err != nil {
 					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 					return &SilentError{ExitCode: 1}
@@ -114,10 +126,56 @@ the level of detail, and --hide-passing to only show failures and warnings.`,
 				return nil
 			}
 
+			// Text output: stream results with category headers
+			w := cmd.OutOrStdout()
 			dbLabel := parseDSNLabel(dsn)
-			maxSeverity := formatReport(w, reports, opts, dbLabel)
+			fmt.Fprintf(w, "Database Health Check: %s\n\n", dbLabel)
 
-			if maxSeverity > check.SeverityWarn {
+			var reports []*check.Report
+			var currentCategory string
+			maxSeverity := check.SeverityOK
+
+			runOpts.OnReport = func(r *check.Report) {
+				reports = append(reports, r)
+				if r.Severity > maxSeverity {
+					maxSeverity = r.Severity
+				}
+
+				// Print category header on transition
+				cat := string(r.Category)
+				if cat != currentCategory {
+					if currentCategory != "" {
+						fmt.Fprintln(w)
+					}
+					title := strings.ToUpper(cat)
+					fmt.Fprintln(w, title)
+					fmt.Fprintln(w, strings.Repeat("─", len(title)))
+					currentCategory = cat
+				}
+
+				if r.Severity == check.SeverityOK && opts.hidePassing {
+					return
+				}
+
+				if opts.detail == string(detailSummary) {
+					printCheckSummary(w, r, opts)
+				} else {
+					printCheckReport(w, r, opts)
+				}
+			}
+			pgdoctor.Run(ctx, conn, runOpts)
+
+			fmt.Fprintln(w)
+			printSummary(w, reports)
+
+			if opts.detail == string(detailSummary) || opts.detail == string(detailBrief) {
+				dimFunc := dimColor()
+				fmt.Fprintf(w, "%s\n", dimFunc("To see more: pgdoctor run ... --detail verbose"))
+				fmt.Fprintf(w, "%s\n", dimFunc("To see how to fix: pgdoctor explain <check-id>"))
+				fmt.Fprintln(w)
+			}
+
+			if maxSeverity == check.SeverityFail {
 				return &SilentError{ExitCode: 1}
 			}
 
@@ -128,11 +186,17 @@ the level of detail, and --hide-passing to only show failures and warnings.`,
 	cmd.Flags().StringSliceVar(&opts.ignored, "ignore", nil, "Checks or categories to ignore")
 	cmd.Flags().StringSliceVar(&opts.only, "only", nil, "Only run these checks or categories")
 	cmd.Flags().StringVar(&opts.preset, "preset", presetAll, "Check preset: all (default), triage")
-	cmd.Flags().StringVar(&opts.detail, "detail", string(detailSummary), "Detail level: summary, brief, verbose, debug")
+	cmd.Flags().StringVar(&opts.detail, "detail", string(detailBrief), "Detail level: summary, brief (default), verbose, debug")
 	cmd.Flags().BoolVar(&opts.hidePassing, "hide-passing", false, "Hide passing checks")
 	cmd.Flags().StringVar(&opts.output, "output", "text", "Output format: text (default), json")
 
 	return cmd
+}
+
+func sortChecksByCategory(checks []check.Package) {
+	sort.SliceStable(checks, func(i, j int) bool {
+		return checks[i].Metadata().Category < checks[j].Metadata().Category
+	})
 }
 
 // parseDSNLabel extracts a human-readable label from a DSN.

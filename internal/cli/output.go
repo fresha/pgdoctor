@@ -5,94 +5,36 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/fatih/color"
 
 	"github.com/fresha/pgdoctor/check"
 )
 
-func formatReport(w io.Writer, reports []*check.Report, opts *runOptions, dbLabel string) check.Severity {
-	fmt.Fprintf(w, "Database Health Check: %s\n\n", dbLabel)
-
-	grouped := groupByCategory(reports)
-	maxSeverity := check.SeverityOK
-
-	for _, category := range sortedCategories(grouped) {
-		categoryReports := grouped[category]
-
-		sort.Slice(categoryReports, func(i, j int) bool {
-			if categoryReports[i].Severity != categoryReports[j].Severity {
-				return categoryReports[i].Severity > categoryReports[j].Severity
-			}
-			return categoryReports[i].CheckID < categoryReports[j].CheckID
-		})
-
-		hasVisibleReports := false
-		for _, report := range categoryReports {
-			if report.Severity > maxSeverity {
-				maxSeverity = report.Severity
-			}
-			if report.Severity != check.SeverityOK || !opts.hidePassing {
-				hasVisibleReports = true
-			}
-		}
-
-		if !hasVisibleReports {
-			continue
-		}
-
-		categoryTitle := strings.ToUpper(category)
-		fmt.Fprintln(w, categoryTitle)
-		fmt.Fprintln(w, strings.Repeat("─", len(categoryTitle)))
-
-		for _, report := range categoryReports {
-			if report.Severity == check.SeverityOK && opts.hidePassing {
-				continue
-			}
-
-			if opts.detail == string(detailSummary) {
-				printCheckSummary(w, report, opts)
-			} else {
-				printCheckReport(w, report, opts)
-			}
-		}
-
-		fmt.Fprintln(w)
-	}
-
-	printSummary(w, reports)
-
-	if opts.detail == string(detailSummary) {
-		dimFunc := dimColor()
-		fmt.Fprintf(w, "%s\n", dimFunc("To see details: pgdoctor run ... --detail brief"))
-		fmt.Fprintf(w, "%s\n", dimFunc("To see how to fix: pgdoctor explain <check-id>"))
-		fmt.Fprintln(w)
-	}
-
-	return maxSeverity
-}
-
-func groupByCategory(reports []*check.Report) map[string][]*check.Report {
-	grouped := map[string][]*check.Report{}
-	for _, report := range reports {
-		category := string(report.Category)
-		grouped[category] = append(grouped[category], report)
-	}
-	return grouped
-}
-
-func sortedCategories(grouped map[string][]*check.Report) []string {
-	categories := make([]string, 0, len(grouped))
-	for category := range grouped {
-		categories = append(categories, category)
-	}
-	sort.Strings(categories)
-	return categories
+func showTiming(opts *runOptions) bool {
+	return opts.detail == string(detailVerbose) || opts.detail == string(detailDebug)
 }
 
 func printCheckSummary(w io.Writer, report *check.Report, opts *runOptions) {
 	label, colorFunc := severityDisplay(report.Severity)
 	dimFunc := dimColor()
+
+	var timingStr string
+	if showTiming(opts) {
+		timingStr = " " + dimFunc(fmt.Sprintf("[%s]", check.FormatDurationMs(float64(report.Duration.Milliseconds()))))
+	}
+
+	// For skipped checks, show the reason inline instead of pass/total count
+	if report.Severity == check.SeveritySkip && len(report.Results) > 0 {
+		fmt.Fprintf(w, "%s %s %s%s — %s\n",
+			colorFunc(fmt.Sprintf("[%s]", label)),
+			report.Name,
+			dimFunc(fmt.Sprintf("(%s)", report.CheckID)),
+			timingStr,
+			dimFunc(report.Results[0].Details))
+		return
+	}
 
 	okCount := 0
 	for _, result := range report.Results {
@@ -102,37 +44,70 @@ func printCheckSummary(w io.Writer, report *check.Report, opts *runOptions) {
 	}
 	total := len(report.Results)
 
-	fmt.Fprintf(w, "%s %s %s %s\n",
+	fmt.Fprintf(w, "%s %s %s %s%s\n",
 		colorFunc(fmt.Sprintf("[%s]", label)),
 		report.Name,
 		dimFunc(fmt.Sprintf("(%s)", report.CheckID)),
-		dimFunc(fmt.Sprintf("(%d/%d)", okCount, total)))
+		dimFunc(fmt.Sprintf("(%d/%d)", okCount, total)),
+		timingStr)
 }
 
 func printCheckReport(w io.Writer, report *check.Report, opts *runOptions) {
 	label, colorFunc := severityDisplay(report.Severity)
 	dimFunc := dimColor()
 
-	singleFindingDuplicate := len(report.Results) == 1 && report.Results[0].ID == report.CheckID
-
-	if !singleFindingDuplicate {
-		fmt.Fprintf(w, "%s %s %s\n",
-			colorFunc(fmt.Sprintf("[%s]", label)),
-			report.Name,
-			dimFunc(fmt.Sprintf("(%s)", report.CheckID)))
+	var timingStr string
+	if showTiming(opts) {
+		timingStr = " " + dimFunc(fmt.Sprintf("[%s]", check.FormatDurationMs(float64(report.Duration.Milliseconds()))))
 	}
 
-	sortedResults := make([]check.Finding, len(report.Results))
-	copy(sortedResults, report.Results)
-	sort.Slice(sortedResults, func(i, j int) bool {
-		if sortedResults[i].Severity != sortedResults[j].Severity {
-			return sortedResults[i].Severity < sortedResults[j].Severity
-		}
-		return sortedResults[i].Name < sortedResults[j].Name
-	})
+	// Skipped checks render as a single line with the reason, same as summary mode
+	if report.Severity == check.SeveritySkip && len(report.Results) > 0 {
+		fmt.Fprintf(w, "%s %s %s%s — %s\n",
+			colorFunc(fmt.Sprintf("[%s]", label)),
+			report.Name,
+			dimFunc(fmt.Sprintf("(%s)", report.CheckID)),
+			timingStr,
+			dimFunc(report.Results[0].Details))
+		return
+	}
 
-	for _, result := range sortedResults {
-		printSubcheck(w, report, result, opts)
+	singleFinding := len(report.Results) == 1 && report.Results[0].ID == report.CheckID
+
+	// For single-finding checks, fold the details into the header line
+	if singleFinding {
+		result := report.Results[0]
+		fmt.Fprintf(w, "%s %s %s%s\n",
+			colorFunc(fmt.Sprintf("[%s]", label)),
+			report.Name,
+			dimFunc(fmt.Sprintf("(%s)", report.CheckID)),
+			timingStr)
+		if result.Severity != check.SeverityOK && result.Details != "" {
+			fmt.Fprintf(w, "%s\n", indent(result.Details, 2))
+		}
+		if result.Table != nil {
+			fmt.Fprintln(w)
+			printTable(w, result.Table, 2, opts)
+		}
+	} else {
+		fmt.Fprintf(w, "%s %s %s%s\n",
+			colorFunc(fmt.Sprintf("[%s]", label)),
+			report.Name,
+			dimFunc(fmt.Sprintf("(%s)", report.CheckID)),
+			timingStr)
+
+		sortedResults := make([]check.Finding, len(report.Results))
+		copy(sortedResults, report.Results)
+		sort.Slice(sortedResults, func(i, j int) bool {
+			if sortedResults[i].Severity != sortedResults[j].Severity {
+				return sortedResults[i].Severity < sortedResults[j].Severity
+			}
+			return sortedResults[i].Name < sortedResults[j].Name
+		})
+
+		for _, result := range sortedResults {
+			printSubcheck(w, report, result, opts)
+		}
 	}
 
 	if opts.detail == string(detailDebug) && report.SQL != "" {
@@ -232,8 +207,10 @@ func printTable(w io.Writer, table *check.Table, indentSpaces int, opts *runOpti
 }
 
 func printSummary(w io.Writer, reports []*check.Report) {
-	okCount, warnCount, failCount := 0, 0, 0
+	okCount, warnCount, failCount, skipCount := 0, 0, 0, 0
+	var totalDuration time.Duration
 	for _, report := range reports {
+		totalDuration += report.Duration
 		switch report.Severity {
 		case check.SeverityOK:
 			okCount++
@@ -241,6 +218,8 @@ func printSummary(w io.Writer, reports []*check.Report) {
 			warnCount++
 		case check.SeverityFail:
 			failCount++
+		case check.SeveritySkip:
+			skipCount++
 		}
 	}
 
@@ -256,8 +235,13 @@ func printSummary(w io.Writer, reports []*check.Report) {
 	if okCount > 0 {
 		summaryParts = append(summaryParts, colorForSeverity(check.SeverityOK)(fmt.Sprintf("%d passed", okCount)))
 	}
+	if skipCount > 0 {
+		summaryParts = append(summaryParts, colorForSeverity(check.SeveritySkip)(fmt.Sprintf("%d skipped", skipCount)))
+	}
 
-	fmt.Fprintf(w, "Summary: %s\n", strings.Join(summaryParts, ", "))
+	dimFunc := dimColor()
+	fmt.Fprintf(w, "Summary: %s %s\n", strings.Join(summaryParts, ", "),
+		dimFunc(fmt.Sprintf("(%d checks in %s)", len(reports), check.FormatDurationMs(float64(totalDuration.Milliseconds())))))
 	fmt.Fprintln(w)
 }
 
@@ -288,6 +272,9 @@ func colorForSeverity(severity check.Severity) func(string) string {
 		return func(s string) string { return fn(s) }
 	case check.SeverityFail:
 		fn := color.New(color.FgRed).SprintFunc()
+		return func(s string) string { return fn(s) }
+	case check.SeveritySkip:
+		fn := color.New(color.FgMagenta).SprintFunc()
 		return func(s string) string { return fn(s) }
 	default:
 		return func(s string) string { return s }

@@ -62,7 +62,7 @@ Run health checks against a PostgreSQL database. The DSN can be passed as a posi
 | `--only` | Only run these checks or categories |
 | `--ignore` | Skip these checks or categories |
 | `--preset` | Check preset: `all` (default), `triage` |
-| `--detail` | Detail level: `summary`, `brief`, `verbose`, `debug` |
+| `--detail` | Detail level: `summary`, `brief` (default), `verbose`, `debug` |
 | `--output` | Output format: `text` (default), `json` |
 | `--hide-passing` | Hide passing checks |
 
@@ -163,22 +163,22 @@ func main() {
     conn, _ := pgx.Connect(ctx, "postgres://localhost:5432/mydb")
     defer conn.Close(ctx)
 
-    reports, err := pgdoctor.Run(ctx, conn, pgdoctor.AllChecks(), nil, nil, nil)
-    if err != nil {
-        panic(err)
-    }
-
-    for _, report := range reports {
-        fmt.Printf("[%s] %s\n", report.CheckID, report.Name)
-    }
+    pgdoctor.Run(ctx, conn, pgdoctor.Options{
+        OnReport: func(report *check.Report) {
+            fmt.Printf("[%s] %s\n", report.CheckID, report.Name)
+        },
+    })
 }
 ```
 
 ### Key API
 
 ```go
-// Run checks (pass AllChecks() for built-in set, or append your own)
-pgdoctor.Run(ctx, conn, checks, cfg, only, ignored) ([]*check.Report, error)
+// Run checks with the given options
+pgdoctor.Run(ctx, conn, pgdoctor.Options{...})
+
+// Collect reports into a slice (built-in handler)
+pgdoctor.Collect(&reports) pgdoctor.ReportHandler
 
 // List all built-in checks
 pgdoctor.AllChecks() []check.Package

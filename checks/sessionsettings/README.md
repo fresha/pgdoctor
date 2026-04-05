@@ -90,7 +90,9 @@ cfg := check.Config{
         "timeout_fail": "5000",   // above this → FAIL (default: 10000)
     },
 }
-reports, err := pgdoctor.Run(ctx, conn, pgdoctor.AllChecks(), cfg, nil, nil)
+pgdoctor.Run(ctx, conn, pgdoctor.Options{
+    Config: cfg,
+})
 ```
 
 | Key | Description | Default |

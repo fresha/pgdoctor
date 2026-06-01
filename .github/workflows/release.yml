@@ -20,9 +20,18 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Build release notes from CHANGELOG
+        run: |
+          awk '
+            /^## \[.*\] - / { if (seen) exit; seen=1; next }
+            seen && /^## \[/ { exit }
+            seen { if (!started && $0 ~ /^[[:space:]]*$/) next; started=1; print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/release-notes.md"
+          cat "$RUNNER_TEMP/release-notes.md"
+
       - uses: goreleaser/goreleaser-action@v6
         with:
           version: latest
-          args: release --clean
+          args: release --clean --release-notes=${{ runner.temp }}/release-notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

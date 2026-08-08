@@ -113,7 +113,7 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
         report.AddFinding(check.Finding{
             ID:       report.CheckID,
             Name:     report.Name,
-            Severity: check.SeverityOK,
+            Severity: check.SeverityPass,
         })
         return report, nil
     }
@@ -191,7 +191,7 @@ pgdoctor.ValidateFilters(checks, filters) (valid, invalid []string)
 report.AddFinding(check.Finding{
     ID:       "specific-validation",
     Name:     "Human-readable name",
-    Severity: check.SeverityFail,    // OK|Warn|Fail
+    Severity: check.SeverityFail,    // Info|Pass|Warn|Fail (Skip is runner-injected on error, never set by a check)
     Details:  "What's wrong",
     Table:    &check.Table{...},     // Optional structured data
     Debug:    "Debug info",          // Only shown with --detail debug
@@ -287,12 +287,13 @@ Five categories:
 
 ### Severity
 
-- `check.SeveritySkip` - Check could not run (timeout, permission error)
-- `check.SeverityOK` - Check passed, no action needed
+- `check.SeverityInfo` - Relevant information, no action expected
+- `check.SeveritySkip` - Check could not run. Injected by the runner when `Check` returns an error (timeout, permission error), or set by a check that ran cleanly but cannot compute its result (e.g. a rate whose observation window is unknown)
+- `check.SeverityPass` - Check passed, no action needed
 - `check.SeverityWarn` - Issue found, non-urgent action
 - `check.SeverityFail` - Issue found, urgent action required
 
-Report severity is automatically the maximum across all findings. `SeveritySkip` is ordered below `SeverityOK` so it doesn't affect severity comparisons.
+Report severity is automatically the maximum across all findings. `SeverityInfo` and `SeveritySkip` are ordered below `SeverityPass` so they don't affect severity comparisons.
 
 ### Presets
 
@@ -316,7 +317,15 @@ When adding a check, ask: **is this useful during an active incident?** If yes, 
 
 ### Modifying Existing Check
 
-**Never edit generated files** (`db/`, `checks.go`).
+**Never edit generated files** (`db/`, `checks.go`). CI runs `sqlc generate` and fails on any difference.
+
+Running `sqlc generate` needs **sqlc v1.30.0** and a live **PostgreSQL 17+** server with `pg_stat_statements` installed. Older majors fail because the queries reference newer catalog columns (`pg_replication_slots.invalidation_reason`). The extension only has to exist, not be preloaded — sqlc reads its catalog entries and never its data:
+
+```bash
+docker run -d --name pgdoctor-sqlc -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:17
+psql postgres://postgres:postgres@localhost:5432/postgres -c 'CREATE EXTENSION pg_stat_statements;'
+sqlc generate
+```
 
 - Changing SQL: edit `query.sql`, run `sqlc generate`, update `check.go` if signature changed
 - Changing logic: edit `check.go` directly
@@ -339,7 +348,7 @@ If a check doesn't appear in `list` or `explain`:
 - Embed README with `//go:embed README.md` and include in `Metadata.Readme`
 - Use `check.NewReport(Metadata())` to create reports
 - Access check info via promoted fields: `report.CheckID`, `report.Name`
-- Report `SeverityOK` when no issues found
+- Report `SeverityPass` when no issues found
 - Keep checks self-contained
 - Use sqlc for all database queries
 - Define query interfaces for testability
@@ -348,7 +357,7 @@ If a check doesn't appear in `list` or `explain`:
 
 - Edit generated files (`db/`, `checks.go`)
 - Create local `id` or `name` variables (use promoted fields)
-- Skip reporting SeverityOK findings
+- Skip reporting SeverityPass findings
 - Hardcode check metadata in CLI
 - Create new categories without discussion
 
@@ -368,7 +377,7 @@ func TestMyCheck(t *testing.T) {
         {
             name:     "all good",
             data:     []db.MyQueryRow{},
-            severity: check.SeverityOK,
+            severity: check.SeverityPass,
         },
         {
             name:     "issue found",
@@ -474,7 +483,10 @@ Each contrib check creates its own sqlc queries internally, using the `check.DBT
 |----------|------------|---------|
 | FAIL | Data loss risk, security issue, imminent outage | No backups, publicly accessible, sequence at 90%+ |
 | WARN | Should fix but not urgent, performance degradation | Old storage type, high bloat, outdated minor version |
-| OK | Everything is fine | Always report at least one OK finding per check |
+| INFO | A signal worth surfacing that demands no action — inventory-style findings renderers hide by default | Tables with FULL replica identity (inventory), per-index cache hit ratios (confounded by OS page cache), extension version inventory |
+| PASS | Everything is fine | Always report at least one PASS finding per check |
+
+`SKIP` is mostly runner-injected: it appears automatically when a check errors (timeout, permission, missing extension). A check may also assign it deliberately when it ran cleanly but cannot produce a result — for example when a rate's observation window is unknown. Prefer that over a PASS, which claims the check looked and found nothing wrong. Assign it by setting `report.Severity = check.SeveritySkip` *after* adding the finding, since `AddFinding` only raises severity and `SeveritySkip` sorts below `SeverityPass`.
 
 **Rule of thumb:** If a DBA would page someone at 3am, it's a FAIL. If it should go in the sprint backlog, it's a WARN.
 

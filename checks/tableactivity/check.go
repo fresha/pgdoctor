@@ -57,9 +57,11 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 		report.AddFinding(check.Finding{
 			ID:       report.CheckID,
 			Name:     report.Name,
-			Severity: check.SeverityOK,
-			Details:  "No table activity data available",
+			Severity: check.SeveritySkip,
+			Details:  "No table activity recorded yet",
 		})
+		report.Severity = check.SeveritySkip
+
 		return report, nil
 	}
 
@@ -85,7 +87,7 @@ func checkHighChurnTables(rows []db.TableActivityRow, report *check.Report) {
 		report.AddFinding(check.Finding{
 			ID:       "high-churn-tables",
 			Name:     "High Churn Tables",
-			Severity: check.SeverityOK,
+			Severity: check.SeverityPass,
 			Details:  "No tables with excessive write activity (>1M writes) detected",
 		})
 		return
@@ -106,14 +108,14 @@ func checkHighChurnTables(rows []db.TableActivityRow, report *check.Report) {
 				check.FormatNumber(totalWrites),
 				check.FormatBytes(check.Int8ToInt64(row.TableSizeBytes)),
 			},
-			Severity: check.SeverityWarn,
+			Severity: check.SeverityInfo,
 		})
 	}
 
 	report.AddFinding(check.Finding{
 		ID:       "high-churn-tables",
 		Name:     "High Churn Tables",
-		Severity: check.SeverityWarn,
+		Severity: check.SeverityInfo,
 		Details:  fmt.Sprintf("Found %d table(s) with high write activity (>1M writes)", len(highChurn)),
 		Table: &check.Table{
 			Headers: headers,
@@ -149,7 +151,7 @@ func checkLowHOTRatio(rows []db.TableActivityRow, report *check.Report) {
 		report.AddFinding(check.Finding{
 			ID:       "low-hot-ratio",
 			Name:     "HOT Update Efficiency",
-			Severity: check.SeverityOK,
+			Severity: check.SeverityPass,
 			Details:  "All large tables have acceptable HOT update ratio (>50%)",
 		})
 		return
@@ -169,14 +171,14 @@ func checkLowHOTRatio(rows []db.TableActivityRow, report *check.Report) {
 				check.FormatNumber(check.Int8ToInt64(row.NTupHotUpd)),
 				check.FormatNumber(check.Int8ToInt64(row.NLiveTup)),
 			},
-			Severity: check.SeverityWarn,
+			Severity: check.SeverityInfo,
 		})
 	}
 
 	report.AddFinding(check.Finding{
 		ID:       "low-hot-ratio",
 		Name:     "HOT Update Efficiency",
-		Severity: check.SeverityWarn,
+		Severity: check.SeverityInfo,
 		Details:  fmt.Sprintf("Found %d large table(s) with low HOT update ratio (<50%%)", len(lowHOT)),
 		Table: &check.Table{
 			Headers: headers,

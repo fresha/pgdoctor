@@ -31,10 +31,10 @@ ORDER BY is_leftover, n.nspname, tbl.relname, idx.relname
 `
 
 type BrokenIndexesRow struct {
-	SchemaName string
-	TableName  string
-	IndexName  string
-	IsLeftover bool
+	SchemaName pgtype.Text
+	TableName  pgtype.Text
+	IndexName  pgtype.Text
+	IsLeftover pgtype.Bool
 }
 
 // Invalid indexes, flagging _ccnew/_ccold REINDEX CONCURRENTLY leftovers via
@@ -147,51 +147,71 @@ func (q *Queries) DatabaseCacheEfficiency(ctx context.Context) (DatabaseCacheEff
 	return i, err
 }
 
-const databaseFreezeAge = `-- name: DatabaseFreezeAge :many
+const databaseFreezeAge = `-- name: DatabaseFreezeAge :one
 SELECT
-  datname::text AS database_name
-  , datfrozenxid::text AS frozen_xid
-  , age(datfrozenxid) AS freeze_age
-  , (
-    SELECT s.setting::bigint FROM pg_settings AS s
-    WHERE s.name = 'autovacuum_freeze_max_age'
-  ) AS freeze_max_age
-FROM pg_database
-WHERE datallowconn = true
-ORDER BY age(datfrozenxid) DESC
+  d.datname::text AS database_name
+  , d.datfrozenxid::text AS frozen_xid
+  , age(d.datfrozenxid)::bigint AS freeze_age
+  , d.datminmxid::text AS min_multixact_id
+  -- mxid_age('0'::xid) returns 2147483647, which would fabricate an instant FAIL.
+  , CASE WHEN d.datminmxid <> '0'::xid THEN mxid_age(d.datminmxid)::bigint ELSE 0 END AS multixact_age
+  , g.freeze_max_age
+  , g.multixact_freeze_max_age
+  , g.failsafe_age
+  , g.multixact_failsafe_age
+FROM pg_catalog.pg_database AS d
+CROSS JOIN (
+  -- The failsafe GUCs are PG14+; COALESCE degrades to the documented default
+  -- instead of erroring on an older major.
+  SELECT
+    coalesce(max(CASE WHEN s.name = 'autovacuum_freeze_max_age' THEN s.setting::bigint END), 200000000) AS freeze_max_age
+    , coalesce(
+      max(CASE WHEN s.name = 'autovacuum_multixact_freeze_max_age' THEN s.setting::bigint END), 400000000
+    ) AS multixact_freeze_max_age
+    , coalesce(max(CASE WHEN s.name = 'vacuum_failsafe_age' THEN s.setting::bigint END), 1600000000) AS failsafe_age
+    , coalesce(
+      max(CASE WHEN s.name = 'vacuum_multixact_failsafe_age' THEN s.setting::bigint END), 1600000000
+    ) AS multixact_failsafe_age
+  FROM pg_catalog.pg_settings AS s
+  WHERE s.name IN (
+    'autovacuum_freeze_max_age'
+    , 'autovacuum_multixact_freeze_max_age'
+    , 'vacuum_failsafe_age'
+    , 'vacuum_multixact_failsafe_age'
+  )
+) AS g
+WHERE d.datname = current_database()
 `
 
 type DatabaseFreezeAgeRow struct {
-	DatabaseName pgtype.Text
-	FrozenXid    pgtype.Text
-	FreezeAge    pgtype.Int4
-	FreezeMaxAge pgtype.Int8
+	DatabaseName          string
+	FrozenXid             string
+	FreezeAge             int64
+	MinMultixactID        string
+	MultixactAge          int64
+	FreezeMaxAge          pgtype.Int8
+	MultixactFreezeMaxAge pgtype.Int8
+	FailsafeAge           pgtype.Int8
+	MultixactFailsafeAge  pgtype.Int8
 }
 
-// Gets transaction ID age for all databases.
-func (q *Queries) DatabaseFreezeAge(ctx context.Context) ([]DatabaseFreezeAgeRow, error) {
-	rows, err := q.db.Query(ctx, databaseFreezeAge)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []DatabaseFreezeAgeRow
-	for rows.Next() {
-		var i DatabaseFreezeAgeRow
-		if err := rows.Scan(
-			&i.DatabaseName,
-			&i.FrozenXid,
-			&i.FreezeAge,
-			&i.FreezeMaxAge,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
+// Connected database only: the other pg_database rows cannot be vacuumed from
+// this connection, so their age is not actionable here.
+func (q *Queries) DatabaseFreezeAge(ctx context.Context) (DatabaseFreezeAgeRow, error) {
+	row := q.db.QueryRow(ctx, databaseFreezeAge)
+	var i DatabaseFreezeAgeRow
+	err := row.Scan(
+		&i.DatabaseName,
+		&i.FrozenXid,
+		&i.FreezeAge,
+		&i.MinMultixactID,
+		&i.MultixactAge,
+		&i.FreezeMaxAge,
+		&i.MultixactFreezeMaxAge,
+		&i.FailsafeAge,
+		&i.MultixactFailsafeAge,
+	)
+	return i, err
 }
 
 const duplicateIndexes = `-- name: DuplicateIndexes :many
@@ -340,18 +360,39 @@ func (q *Queries) DuplicateIndexes(ctx context.Context) ([]DuplicateIndexesRow, 
 }
 
 const hasPgStatStatements = `-- name: HasPgStatStatements :one
-SELECT EXISTS(
-  SELECT 1 FROM pg_extension
-  WHERE extname = 'pg_stat_statements'
-)
+SELECT
+  EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements')
+  AND EXISTS(SELECT 1 FROM pg_settings WHERE name = 'pg_stat_statements.max')
+  AND to_regclass('pg_stat_statements_info') IS NOT NULL
 `
 
-// Checks if pg_stat_statements extension is installed.
-func (q *Queries) HasPgStatStatements(ctx context.Context) (bool, error) {
+// Checks if pg_stat_statements can be read. Installed is not enough: it can be
+// created without the library preloaded, or into a schema outside search_path, and
+// then every read errors. The GUC only exists when the library loaded.
+func (q *Queries) HasPgStatStatements(ctx context.Context) (pgtype.Bool, error) {
 	row := q.db.QueryRow(ctx, hasPgStatStatements)
-	var exists bool
-	err := row.Scan(&exists)
-	return exists, err
+	var column_1 pgtype.Bool
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
+const hiddenQueryTextCount = `-- name: HiddenQueryTextCount :one
+SELECT COUNT(*)::bigint
+FROM pg_stat_statements
+WHERE
+  query = '<insufficient privilege>'
+  AND dbid = (SELECT d.oid FROM pg_database AS d WHERE d.datname = current_database())
+`
+
+// Counts pg_stat_statements rows whose text the current role cannot read.
+// Only superusers and roles with pg_read_all_stats see other users' query
+// text; everyone else gets '<insufficient privilege>', which would silently
+// shrink the analyzed set and produce a confident PASS on partial data.
+func (q *Queries) HiddenQueryTextCount(ctx context.Context) (pgtype.Int8, error) {
+	row := q.db.QueryRow(ctx, hiddenQueryTextCount)
+	var count pgtype.Int8
+	err := row.Scan(&count)
+	return count, err
 }
 
 const highSeqScanTables = `-- name: HighSeqScanTables :many
@@ -417,6 +458,109 @@ func (q *Queries) HighSeqScanTables(ctx context.Context) ([]HighSeqScanTablesRow
 			&i.EstimatedRows,
 			&i.TableSizeBytes,
 			&i.IndexCount,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const horizonPins = `-- name: HorizonPins :many
+WITH pins AS (
+  SELECT
+    (CASE WHEN s.slot_type = 'logical' THEN 'logical_slot' ELSE 'physical_slot' END)::text AS source
+    , s.slot_name::text AS object_name
+    , v.pin_column
+    , v.pinned_xid
+    , coalesce(s.active, FALSE) AS active
+    , coalesce(s.wal_status, 'unknown')::text AS wal_status
+    , format(
+      '%s slot %s, %s, WAL %s'
+      , s.slot_type
+      , s.slot_name
+      , CASE WHEN s.active THEN 'active' ELSE 'inactive' END
+      , coalesce(s.wal_status, 'unknown')
+    )::text AS detail
+  FROM pg_catalog.pg_replication_slots AS s
+  -- The two values pin independently: a logical slot usually holds only
+  -- catalog_xmin, a physical slot with hot_standby_feedback only xmin.
+  CROSS JOIN LATERAL (
+    VALUES ('slot_xmin'::text, s.xmin), ('slot_catalog_xmin'::text, s.catalog_xmin)
+  ) AS v (pin_column, pinned_xid)
+  -- A slot that pins nothing has a NULL here; age(NULL) is NULL, but dropping the
+  -- row keeps a non-pinning slot out of the result set entirely.
+  WHERE v.pinned_xid IS NOT NULL AND v.pinned_xid <> '0'::xid
+
+  UNION ALL
+
+  -- A prepared transaction is always holding, so there is no inactive variant to
+  -- reason about and the wal_status rules stay slot-only.
+  SELECT
+    'prepared_xact'::text
+    , x.gid::text
+    , 'prepared_xid'::text
+    , x.transaction
+    , TRUE
+    , 'unknown'::text
+    , format(
+      'prepared transaction %s on %s, owner %s, prepared %s ago'
+      , x.gid, x.database, x.owner, date_trunc('second', now() - x.prepared)
+    )::text
+  FROM pg_catalog.pg_prepared_xacts AS x
+  WHERE x.transaction <> '0'::xid
+)
+
+SELECT
+  p.source
+  , p.object_name
+  , p.pin_column
+  , age(p.pinned_xid)::bigint AS pin_age
+  , p.active
+  , p.wal_status
+  , p.detail
+FROM pins AS p
+ORDER BY pin_age DESC
+`
+
+type HorizonPinsRow struct {
+	Source     pgtype.Text
+	ObjectName pgtype.Text
+	PinColumn  pgtype.Text
+	PinAge     pgtype.Int8
+	Active     pgtype.Bool
+	WalStatus  pgtype.Text
+	Detail     pgtype.Text
+}
+
+// Durable pins on the xmin horizon: replication slots and prepared transactions
+// are on-disk state that does not resolve itself, so a single read is a snapshot
+// rather than a race. Backends, lock waiters and in-flight vacuums are
+// deliberately absent — reading those needs luck in timing and belongs to a live
+// investigation (`houston dba xmin`).
+//
+// Slot recency is the age of the pinned xid, not wall-clock time: the column PG17
+// added for that does not exist on PG14, which is this check's floor.
+func (q *Queries) HorizonPins(ctx context.Context) ([]HorizonPinsRow, error) {
+	rows, err := q.db.Query(ctx, horizonPins)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []HorizonPinsRow
+	for rows.Next() {
+		var i HorizonPinsRow
+		if err := rows.Scan(
+			&i.Source,
+			&i.ObjectName,
+			&i.PinColumn,
+			&i.PinAge,
+			&i.Active,
+			&i.WalStatus,
+			&i.Detail,
 		); err != nil {
 			return nil, err
 		}
@@ -579,8 +723,7 @@ WITH index_info AS (
 )
 
 SELECT
-  schemaname
-  , tablename
+  schemaname || '.' || tablename AS table_name
   , indexname
   , actual_pages
   , est_pages
@@ -592,13 +735,15 @@ SELECT
     ELSE 0
   END AS bloat_percent
 FROM bloat_estimate
-WHERE actual_pages > est_pages
+WHERE
+  actual_pages > est_pages
+  -- 200MB listing floor; any index wasting >=2GiB is necessarily larger, so no arm is lost
+  AND actual_bytes >= 200 * 1024 * 1024
 ORDER BY bloat_percent DESC, bloat_bytes DESC
 `
 
 type IndexBloatRow struct {
-	Schemaname   pgtype.Text
-	Tablename    pgtype.Text
+	TableName    pgtype.Text
 	Indexname    pgtype.Text
 	ActualPages  int32
 	EstPages     pgtype.Int8
@@ -619,8 +764,7 @@ func (q *Queries) IndexBloat(ctx context.Context) ([]IndexBloatRow, error) {
 	for rows.Next() {
 		var i IndexBloatRow
 		if err := rows.Scan(
-			&i.Schemaname,
-			&i.Tablename,
+			&i.TableName,
 			&i.Indexname,
 			&i.ActualPages,
 			&i.EstPages,
@@ -638,35 +782,92 @@ func (q *Queries) IndexBloat(ctx context.Context) ([]IndexBloatRow, error) {
 	return items, nil
 }
 
+const indexCacheEfficiency = `-- name: IndexCacheEfficiency :many
+WITH ranked AS (
+  SELECT
+    indexrelid
+    , coalesce(idx_scan, 0) AS idx_scan
+    , rank() OVER (ORDER BY coalesce(idx_scan, 0) DESC) AS scan_rank
+    , coalesce(idx_scan, 0)::numeric / NULLIF(sum(coalesce(idx_scan, 0)) OVER (), 0) AS scan_share
+  FROM pg_stat_user_indexes
+)
+SELECT
+  (psio.schemaname || '.' || psio.indexrelname)::text AS index_name
+  , pg_relation_size(psio.indexrelid) AS index_size_bytes
+  , ranked.idx_scan AS idx_scan
+  , ranked.scan_rank AS scan_rank
+  , ranked.scan_share AS scan_share
+  , CASE
+    WHEN coalesce(psio.idx_blks_hit, 0) + coalesce(psio.idx_blks_read, 0) = 0 THEN NULL
+    ELSE round(100.0 * psio.idx_blks_hit / (psio.idx_blks_hit + psio.idx_blks_read), 2)
+  END AS cache_hit_ratio
+FROM pg_statio_user_indexes AS psio
+INNER JOIN ranked ON psio.indexrelid = ranked.indexrelid
+WHERE
+  psio.schemaname = 'public'
+  -- rank<=20 rows bypass the size floor so the top-20 ranking is verifiable at --detail debug
+  AND (pg_relation_size(psio.indexrelid) >= 500 * 1024 * 1024 OR ranked.scan_rank <= 20)
+ORDER BY pg_relation_size(psio.indexrelid) DESC
+`
+
+type IndexCacheEfficiencyRow struct {
+	IndexName      pgtype.Text
+	IndexSizeBytes pgtype.Int8
+	IdxScan        pgtype.Int8
+	ScanRank       pgtype.Int8
+	ScanShare      pgtype.Numeric
+	CacheHitRatio  pgtype.Numeric
+}
+
+// Per-index buffer cache hit ratios with scan rank and share across all user
+// indexes. Rank/share are computed before the size floor so a small index still
+// counts toward the traffic universe; the outer filters only limit what we list.
+func (q *Queries) IndexCacheEfficiency(ctx context.Context) ([]IndexCacheEfficiencyRow, error) {
+	rows, err := q.db.Query(ctx, indexCacheEfficiency)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []IndexCacheEfficiencyRow
+	for rows.Next() {
+		var i IndexCacheEfficiencyRow
+		if err := rows.Scan(
+			&i.IndexName,
+			&i.IndexSizeBytes,
+			&i.IdxScan,
+			&i.ScanRank,
+			&i.ScanShare,
+			&i.CacheHitRatio,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const indexUsageStats = `-- name: IndexUsageStats :many
 SELECT
   (n.nspname || '.' || tbl.relname)::text AS table_name
   , psai.indexrelname::text AS index_name
-  , c.reltuples::bigint AS num_rows
   , x.indisprimary AS is_primary
   , x.indisunique AS is_unique
   , pg_relation_size(psai.indexrelid) AS index_size_bytes
   , coalesce(psai.idx_scan, 0) AS idx_scan
-  , coalesce(psai.idx_tup_read, 0) AS idx_tup_read
-  , coalesce(psai.idx_tup_fetch, 0) AS idx_tup_fetch
   , coalesce(ut.n_tup_ins, 0) + coalesce(ut.n_tup_upd, 0) + coalesce(ut.n_tup_del, 0) AS table_writes
-  , coalesce(psaio.idx_blks_hit, 0) AS idx_blks_hit
-  , coalesce(psaio.idx_blks_read, 0) AS idx_blks_read
-  , CASE
-    WHEN coalesce(psaio.idx_blks_hit, 0) + coalesce(psaio.idx_blks_read, 0) = 0 THEN NULL
-    ELSE round(
-      100.0 * psaio.idx_blks_hit / (psaio.idx_blks_hit + psaio.idx_blks_read)
-      , 2
-    )
-  END AS cache_hit_ratio
-  , pg_get_indexdef(psai.indexrelid) AS indexdef
+  , (SELECT stats_reset FROM pg_stat_database WHERE datname = current_database())::timestamptz AS stats_reset
+  , (
+    SELECT extract(EPOCH FROM (now() - stats_reset))::bigint
+    FROM pg_stat_database WHERE datname = current_database()
+  ) AS stats_age_seconds
 FROM pg_stat_user_indexes AS psai
 INNER JOIN pg_index AS x ON psai.indexrelid = x.indexrelid
 INNER JOIN pg_class AS tbl ON x.indrelid = tbl.oid
 INNER JOIN pg_namespace AS n ON tbl.relnamespace = n.oid
-LEFT JOIN pg_class AS c ON psai.relid = c.oid
 LEFT JOIN pg_stat_user_tables AS ut ON tbl.oid = ut.relid
-LEFT JOIN pg_statio_user_indexes AS psaio ON psai.indexrelid = psaio.indexrelid
 WHERE
   n.nspname = 'public'
 ORDER BY
@@ -674,25 +875,18 @@ ORDER BY
 `
 
 type IndexUsageStatsRow struct {
-	TableName      pgtype.Text
-	IndexName      pgtype.Text
-	NumRows        pgtype.Int8
-	IsPrimary      bool
-	IsUnique       bool
-	IndexSizeBytes pgtype.Int8
-	IdxScan        pgtype.Int8
-	IdxTupRead     pgtype.Int8
-	IdxTupFetch    pgtype.Int8
-	TableWrites    pgtype.Int8
-	IdxBlksHit     pgtype.Int8
-	IdxBlksRead    pgtype.Int8
-	CacheHitRatio  pgtype.Numeric
-	Indexdef       pgtype.Text
+	TableName       pgtype.Text
+	IndexName       pgtype.Text
+	IsPrimary       bool
+	IsUnique        bool
+	IndexSizeBytes  pgtype.Int8
+	IdxScan         pgtype.Int8
+	TableWrites     pgtype.Int8
+	StatsReset      pgtype.Timestamptz
+	StatsAgeSeconds pgtype.Int8
 }
 
-// Identifies indexes with usage statistics for health analysis.
-// Excludes: system schemas.
-// Returns data for subchecks: unused-indexes, low-usage-indexes, index-cache-ratio.
+// Excludes: system schemas. Returns data for subchecks: unused-indexes, low-usage-indexes.
 func (q *Queries) IndexUsageStats(ctx context.Context) ([]IndexUsageStatsRow, error) {
 	rows, err := q.db.Query(ctx, indexUsageStats)
 	if err != nil {
@@ -705,18 +899,57 @@ func (q *Queries) IndexUsageStats(ctx context.Context) ([]IndexUsageStatsRow, er
 		if err := rows.Scan(
 			&i.TableName,
 			&i.IndexName,
-			&i.NumRows,
 			&i.IsPrimary,
 			&i.IsUnique,
 			&i.IndexSizeBytes,
 			&i.IdxScan,
-			&i.IdxTupRead,
-			&i.IdxTupFetch,
 			&i.TableWrites,
-			&i.IdxBlksHit,
-			&i.IdxBlksRead,
-			&i.CacheHitRatio,
-			&i.Indexdef,
+			&i.StatsReset,
+			&i.StatsAgeSeconds,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const installedExtensions = `-- name: InstalledExtensions :many
+SELECT
+  e.extname::text AS extension_name
+  , e.extversion::text AS installed_version
+  , ae.default_version
+  , current_setting('server_version_num')::int AS server_version_num
+FROM pg_catalog.pg_extension AS e
+LEFT JOIN pg_catalog.pg_available_extensions AS ae ON e.extname = ae.name
+ORDER BY e.extname
+`
+
+type InstalledExtensionsRow struct {
+	ExtensionName    string
+	InstalledVersion string
+	DefaultVersion   pgtype.Text
+	ServerVersionNum int32
+}
+
+// Inventories every installed extension with its installed version, the version bundled on disk (default_version; NULL when the control file is absent), and the server version. Read-only, AccessShareLock on catalogs only, sub-ms, PG14-17.
+func (q *Queries) InstalledExtensions(ctx context.Context) ([]InstalledExtensionsRow, error) {
+	rows, err := q.db.Query(ctx, installedExtensions)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []InstalledExtensionsRow
+	for rows.Next() {
+		var i InstalledExtensionsRow
+		if err := rows.Scan(
+			&i.ExtensionName,
+			&i.InstalledVersion,
+			&i.DefaultVersion,
+			&i.ServerVersionNum,
 		); err != nil {
 			return nil, err
 		}
@@ -943,7 +1176,7 @@ FROM pg_stat_activity
 WHERE
   state = 'idle'
   AND pid != pg_backend_pid()
-  AND (now() - state_change) > interval '30 minutes'
+  AND (now() - state_change) > interval '1 hour'
 ORDER BY state_change ASC
 `
 
@@ -958,7 +1191,7 @@ type LongIdleConnectionsRow struct {
 	ConnectionAgeSeconds pgtype.Int8
 }
 
-// Identifies connections that have been idle for too long (potential pool leak).
+// Identifies connections idle past the 1h idle_session_timeout backstop (unreaped pool accumulation).
 func (q *Queries) LongIdleConnections(ctx context.Context) ([]LongIdleConnectionsRow, error) {
 	rows, err := q.db.Query(ctx, longIdleConnections)
 	if err != nil {
@@ -1007,18 +1240,55 @@ func (q *Queries) PGVersion(ctx context.Context) (PGVersionRow, error) {
 }
 
 const partitionedTablesWithKeys = `-- name: PartitionedTablesWithKeys :many
-WITH partition_stats AS (
-  -- Single aggregation of all partition metrics from child tables
+WITH RECURSIVE relevant_parents AS (
+  -- Restrict the size/stat aggregation below to the partitioned tables this
+  -- check actually reports on. Without this, pg_total_relation_size() runs for
+  -- every inherited relation in the database, including the excluded schemas.
+  SELECT c.oid
+  FROM pg_catalog.pg_class AS c
+  INNER JOIN pg_catalog.pg_namespace AS n ON c.relnamespace = n.oid
+  INNER JOIN pg_partitioned_table AS pt ON c.oid = pt.partrelid
+  WHERE
+    c.relkind = 'p'
+    AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'pgpartman', 'debezium', 'cron')
+)
+
+, descendants AS (
+  -- Walk the whole partition tree, not just the direct children. An
+  -- intermediate node of a sub-partitioned table is itself relkind = 'p', so it
+  -- has no storage (pg_total_relation_size() returns 0) and no
+  -- pg_stat_user_tables counters: stopping at depth one reports such a parent as
+  -- 0 bytes with 0 scans.
   SELECT
-    i.inhparent
+    rp.oid AS root_oid
+    , i.inhrelid AS relid
+  FROM relevant_parents AS rp
+  INNER JOIN pg_catalog.pg_inherits AS i ON i.inhparent = rp.oid
+
+  UNION ALL
+
+  SELECT
+    d.root_oid
+    , i.inhrelid
+  FROM descendants AS d
+  INNER JOIN pg_catalog.pg_inherits AS i ON i.inhparent = d.relid
+)
+
+, partition_stats AS (
+  -- Single aggregation of all partition metrics from the leaf tables. Only
+  -- leaves store rows, so intermediate partitioned nodes are excluded here and
+  -- partition_count counts leaves.
+  SELECT
+    d.root_oid
     , COUNT(*)::bigint AS partition_count
-    , COALESCE(SUM(pg_catalog.pg_total_relation_size(i.inhrelid)), 0)::bigint AS total_size_bytes
+    , COALESCE(SUM(pg_catalog.pg_total_relation_size(d.relid)), 0)::bigint AS total_size_bytes
     , COALESCE(SUM(s.n_live_tup), 0)::bigint AS estimated_rows
     , COALESCE(SUM(s.seq_scan), 0)::bigint AS total_seq_scans
     , COALESCE(SUM(s.idx_scan), 0)::bigint AS total_idx_scans
-  FROM pg_inherits AS i
-  LEFT JOIN pg_stat_user_tables AS s ON i.inhrelid = s.relid
-  GROUP BY i.inhparent
+  FROM descendants AS d
+  INNER JOIN pg_catalog.pg_class AS leaf ON d.relid = leaf.oid AND leaf.relkind <> 'p'
+  LEFT JOIN pg_stat_user_tables AS s ON d.relid = s.relid
+  GROUP BY d.root_oid
 )
 
 SELECT
@@ -1043,7 +1313,7 @@ SELECT
 FROM pg_catalog.pg_class AS c
 INNER JOIN pg_catalog.pg_namespace AS n ON c.relnamespace = n.oid
 INNER JOIN pg_partitioned_table AS pt ON c.oid = pt.partrelid
-LEFT JOIN partition_stats AS ps ON c.oid = ps.inhparent
+LEFT JOIN partition_stats AS ps ON c.oid = ps.root_oid
 WHERE
   c.relkind = 'p'
   AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'pgpartman', 'debezium', 'cron')
@@ -1097,38 +1367,200 @@ func (q *Queries) PartitionedTablesWithKeys(ctx context.Context) ([]PartitionedT
 	return items, nil
 }
 
-const queryStatsFromStatStatements = `-- name: QueryStatsFromStatStatements :many
+const queryStatsCapacity = `-- name: QueryStatsCapacity :one
+WITH counters AS (
+  SELECT
+    (SELECT count(*) FROM pg_stat_statements(false))::bigint AS entries
+    , (
+      SELECT s.setting
+      FROM pg_catalog.pg_settings AS s
+      WHERE s.name = 'pg_stat_statements.max'
+    )::bigint AS max_entries
+    , i.dealloc AS eviction_events
+    , i.stats_reset
+    , extract(EPOCH FROM (now() - i.stats_reset)) AS window_seconds
+  FROM pg_stat_statements_info AS i
+)
+
+, sized AS (
+  SELECT
+    c.entries
+    , c.max_entries
+    , c.eviction_events
+    , c.stats_reset
+    , c.window_seconds
+    , greatest(10, c.max_entries * 5 / 100) AS entries_per_event
+  FROM counters AS c
+)
+
 SELECT
-  queryid::bigint AS query_id
-  , LEFT(REGEXP_REPLACE(query, '\s+', ' ', 'g'), 80)::text AS query
-  , calls::bigint AS calls
-  , total_exec_time::double precision AS total_exec_time
-  , mean_exec_time::double precision AS mean_exec_time
-  , rows::bigint AS rows_returned
-FROM pg_stat_statements
-WHERE
-  calls > 10
-  AND query NOT LIKE 'COPY%'
-  AND query NOT LIKE 'SET %'
-  AND query !~ '^(BEGIN|COMMIT|ROLLBACK|SAVEPOINT|PREPARE|DEALLOCATE)'
-  AND query !~ '^(VACUUM|ANALYZE|REINDEX|CLUSTER)'
-  AND query !~ '^(CREATE|DROP|ALTER|TRUNCATE)'
-  AND (query ILIKE '%SELECT%' OR query ILIKE '%UPDATE%' OR query ILIKE '%DELETE%')
+  entries
+  , max_entries
+  , (eviction_events * entries_per_event)::bigint AS entries_discarded
+  , stats_reset
+  , window_seconds::double precision
+  -- Hours to turn the table over once. NULL when nothing was evicted.
+  , (CASE
+    WHEN eviction_events > 0
+      THEN max_entries * window_seconds / (eviction_events * entries_per_event * 3600)
+  END)::double precision AS recycle_hours
+  , (CASE
+    WHEN max_entries IS NULL OR max_entries <= 0
+      THEN 'pg_stat_statements.max is unreadable, so occupancy has no capacity to be a share of.'
+  END)::text AS usage_skip_reason
+  -- Below the window floor one eviction alone reaches the warn threshold, and
+  -- pgdoctor's own availability probe can cause one. 0.5 is that threshold as
+  -- turnover per day; 1.1 keeps a single event clear of it rather than on it.
+  , (CASE
+    WHEN max_entries IS NULL OR max_entries <= 0
+      THEN 'pg_stat_statements.max is unreadable, so turnover has no capacity to be a share of.'
+    WHEN stats_reset IS NULL
+      THEN 'Counter window unknown, so the eviction rate cannot be computed.'
+    WHEN window_seconds < greatest(
+      3600, entries_per_event::numeric / max_entries / 0.5 * 86400 * 1.1
+    )
+      THEN 'Counters cover only '
+        || CASE
+          WHEN window_seconds < 3600 THEN round((window_seconds / 60)::numeric) || 'm'
+          ELSE round((window_seconds / 3600)::numeric, 1) || 'h'
+        END
+        || ', too short to tell a rate from a single eviction.'
+  END)::text AS rate_skip_reason
+FROM sized
+`
+
+type QueryStatsCapacityRow struct {
+	Entries          pgtype.Int8
+	MaxEntries       pgtype.Int8
+	EntriesDiscarded pgtype.Int8
+	StatsReset       pgtype.Timestamptz
+	WindowSeconds    pgtype.Float8
+	RecycleHours     pgtype.Float8
+	UsageSkipReason  pgtype.Text
+	RateSkipReason   pgtype.Text
+}
+
+// entries and pg_stat_statements.max are cluster-wide, so neither is filtered by
+// database. pg_stat_statements(false) skips the query-text file, which is what
+// makes the view expensive; a count does not need it. max is read through
+// pg_settings so an unloaded library yields NULL instead of an error.
+// dealloc counts events, not entries. entry_dealloc() discards
+// Max(10, max * USAGE_DEALLOC_PERCENT / 100) per event; the floor matters because
+// max bottoms out at 100, where 5% is 5 and the real batch is twice that.
+func (q *Queries) QueryStatsCapacity(ctx context.Context) (QueryStatsCapacityRow, error) {
+	row := q.db.QueryRow(ctx, queryStatsCapacity)
+	var i QueryStatsCapacityRow
+	err := row.Scan(
+		&i.Entries,
+		&i.MaxEntries,
+		&i.EntriesDiscarded,
+		&i.StatsReset,
+		&i.WindowSeconds,
+		&i.RecycleHours,
+		&i.UsageSkipReason,
+		&i.RateSkipReason,
+	)
+	return i, err
+}
+
+const queryStatsFromStatStatements = `-- name: QueryStatsFromStatStatements :many
+WITH candidates AS (
+  SELECT
+    queryid::bigint AS query_id
+    , LOWER(REGEXP_REPLACE(query, '\s+', ' ', 'g'))::text AS query
+    , calls::bigint AS calls
+    , total_exec_time::double precision AS total_exec_time
+    , mean_exec_time::double precision AS mean_exec_time
+    , rows::bigint AS rows_returned
+    -- Counters are cumulative since this reset, so the report has to say over
+    -- what period. Available from pg_stat_statements 1.9, which the toplevel
+    -- filter above already requires.
+    , (
+      SELECT extract(EPOCH FROM (now() - i.stats_reset))::bigint
+      FROM pg_stat_statements_info AS i
+    ) AS stats_age_seconds
+  FROM pg_stat_statements
+  WHERE
+    dbid = (SELECT d.oid FROM pg_database AS d WHERE d.datname = current_database())
+    AND toplevel
+    AND calls > 10
+    -- Only statements that scan the table can prune partitions, so match on the
+    -- leading keyword. An INSERT routes each row to a partition by its key value
+    -- and never prunes; matching '%UPDATE%' anywhere in the text used to accept
+    -- every INSERT that carried an "updated_at" column. Anchoring here also
+    -- excludes utility statements (COPY, SET, VACUUM, transaction control, DDL).
+    AND query ~* '^\s*(WITH|SELECT|UPDATE|DELETE)\M'
+    -- A CTE can still wrap an INSERT (WITH v AS (...) INSERT INTO ...), which the
+    -- leading keyword alone does not catch. Excluding INSERT INTO anywhere also
+    -- drops INSERT ... SELECT, whose target table is routed rather than pruned.
+    AND query !~* '\minsert\s+into\M'
+)
+
+SELECT
+  query_id
+  , query
+  , calls
+  , total_exec_time
+  , mean_exec_time
+  , rows_returned
+  , stats_age_seconds
+FROM (
+  SELECT
+    query_id
+    , query
+    , calls
+    , total_exec_time
+    , mean_exec_time
+    , rows_returned
+    , stats_age_seconds
+  FROM candidates
+  ORDER BY total_exec_time DESC
+  LIMIT 500
+) AS by_exec_time
+
+UNION
+
+SELECT
+  query_id
+  , query
+  , calls
+  , total_exec_time
+  , mean_exec_time
+  , rows_returned
+  , stats_age_seconds
+FROM (
+  SELECT
+    query_id
+    , query
+    , calls
+    , total_exec_time
+    , mean_exec_time
+    , rows_returned
+    , stats_age_seconds
+  FROM candidates
+  ORDER BY calls DESC
+  LIMIT 500
+) AS by_calls
+
 ORDER BY total_exec_time DESC
-LIMIT 500
 `
 
 type QueryStatsFromStatStatementsRow struct {
-	QueryID       pgtype.Int8
-	Query         pgtype.Text
-	Calls         pgtype.Int8
-	TotalExecTime pgtype.Float8
-	MeanExecTime  pgtype.Float8
-	RowsReturned  pgtype.Int8
+	QueryID         pgtype.Int8
+	Query           pgtype.Text
+	Calls           pgtype.Int8
+	TotalExecTime   pgtype.Float8
+	MeanExecTime    pgtype.Float8
+	RowsReturned    pgtype.Int8
+	StatsAgeSeconds pgtype.Int8
 }
 
 // Gets query statistics from pg_stat_statements for partition key analysis.
 // Returns queries with significant usage to check against partitioned tables.
+// Samples both axes: a single "top 500 by total_exec_time" cut is biased towards
+// slow statements and systematically drops cheap high-frequency ones, which are
+// exactly where a missing partition filter compounds at scale. UNION deduplicates
+// the statements ranking on both axes, so the result is at most 1000 rows.
 func (q *Queries) QueryStatsFromStatStatements(ctx context.Context) ([]QueryStatsFromStatStatementsRow, error) {
 	rows, err := q.db.Query(ctx, queryStatsFromStatStatements)
 	if err != nil {
@@ -1145,6 +1577,7 @@ func (q *Queries) QueryStatsFromStatStatements(ctx context.Context) ([]QueryStat
 			&i.TotalExecTime,
 			&i.MeanExecTime,
 			&i.RowsReturned,
+			&i.StatsAgeSeconds,
 		); err != nil {
 			return nil, err
 		}
@@ -1744,19 +2177,11 @@ func (q *Queries) SessionSettings(ctx context.Context) ([]SessionSettingsRow, er
 
 const sessionStatistics = `-- name: SessionStatistics :one
 SELECT
-  COALESCE(SUM(session_time), 0)::double precision AS total_session_time_ms
-  , COALESCE(SUM(active_time), 0)::double precision AS total_active_time_ms
-  , COALESCE(SUM(idle_in_transaction_time), 0)::double precision AS total_idle_in_txn_time_ms
+  COALESCE(SUM(idle_in_transaction_time), 0)::double precision AS total_idle_in_txn_time_ms
   , COALESCE(SUM(sessions), 0)::bigint AS total_sessions
   , COALESCE(SUM(sessions_abandoned), 0)::bigint AS sessions_abandoned
   , COALESCE(SUM(sessions_fatal), 0)::bigint AS sessions_fatal
   , COALESCE(SUM(sessions_killed), 0)::bigint AS sessions_killed
-  -- Calculate session busy ratio (active_time / session_time)
-  , CASE
-    WHEN COALESCE(SUM(session_time), 0) > 0
-      THEN ROUND((COALESCE(SUM(active_time), 0) / COALESCE(SUM(session_time), 0) * 100)::numeric, 2)
-    ELSE 0
-  END::double precision AS session_busy_ratio_percent
 FROM pg_stat_database
 WHERE
   datname IS NOT NULL
@@ -1764,14 +2189,11 @@ WHERE
 `
 
 type SessionStatisticsRow struct {
-	TotalSessionTimeMs      pgtype.Float8
-	TotalActiveTimeMs       pgtype.Float8
-	TotalIdleInTxnTimeMs    pgtype.Float8
-	TotalSessions           pgtype.Int8
-	SessionsAbandoned       pgtype.Int8
-	SessionsFatal           pgtype.Int8
-	SessionsKilled          pgtype.Int8
-	SessionBusyRatioPercent pgtype.Float8
+	TotalIdleInTxnTimeMs pgtype.Float8
+	TotalSessions        pgtype.Int8
+	SessionsAbandoned    pgtype.Int8
+	SessionsFatal        pgtype.Int8
+	SessionsKilled       pgtype.Int8
 }
 
 // Gets session time statistics from pg_stat_database (PostgreSQL 14+).
@@ -1781,14 +2203,11 @@ func (q *Queries) SessionStatistics(ctx context.Context) (SessionStatisticsRow, 
 	row := q.db.QueryRow(ctx, sessionStatistics)
 	var i SessionStatisticsRow
 	err := row.Scan(
-		&i.TotalSessionTimeMs,
-		&i.TotalActiveTimeMs,
 		&i.TotalIdleInTxnTimeMs,
 		&i.TotalSessions,
 		&i.SessionsAbandoned,
 		&i.SessionsFatal,
 		&i.SessionsKilled,
-		&i.SessionBusyRatioPercent,
 	)
 	return i, err
 }
@@ -1796,27 +2215,25 @@ func (q *Queries) SessionStatistics(ctx context.Context) (SessionStatisticsRow, 
 const statisticsFreshness = `-- name: StatisticsFreshness :one
 SELECT
   stats_reset
-  , coalesce(
-    extract(EPOCH FROM (now() - stats_reset)) / 86400
-    , 999
-  )::int AS age_days
-  , (now() - stats_reset) AS age_interval
+  , extract(EPOCH FROM (now() - stats_reset))::bigint AS age_seconds
+  , extract(EPOCH FROM (now() - pg_postmaster_start_time()))::bigint AS uptime_seconds
 FROM pg_stat_database
 WHERE datname = current_database()
 `
 
 type StatisticsFreshnessRow struct {
-	StatsReset  pgtype.Timestamptz
-	AgeDays     pgtype.Int4
-	AgeInterval pgtype.Interval
+	StatsReset    pgtype.Timestamptz
+	AgeSeconds    pgtype.Int8
+	UptimeSeconds pgtype.Int8
 }
 
 // Returns statistics age for the current database.
-// Use to validate stats are meaningful before relying on usage-based checks.
+// Only pg_stat_reset() records a timestamp; a crash or rebuilt replica zeroes the
+// counters silently, so uptime is the lower bound when stats_reset is NULL.
 func (q *Queries) StatisticsFreshness(ctx context.Context) (StatisticsFreshnessRow, error) {
 	row := q.db.QueryRow(ctx, statisticsFreshness)
 	var i StatisticsFreshnessRow
-	err := row.Scan(&i.StatsReset, &i.AgeDays, &i.AgeInterval)
+	err := row.Scan(&i.StatsReset, &i.AgeSeconds, &i.UptimeSeconds)
 	return i, err
 }
 
@@ -1951,39 +2368,297 @@ func (q *Queries) TableBloat(ctx context.Context) ([]TableBloatRow, error) {
 	return items, nil
 }
 
-const tableFreezeAge = `-- name: TableFreezeAge :many
+const tableCacheEfficiency = `-- name: TableCacheEfficiency :many
+WITH ranked AS (
+  SELECT
+    relid
+    , coalesce(seq_scan, 0) + coalesce(idx_scan, 0) AS reads
+    , rank() OVER (ORDER BY coalesce(seq_scan, 0) + coalesce(idx_scan, 0) DESC) AS read_rank
+    , (coalesce(seq_scan, 0) + coalesce(idx_scan, 0))::numeric
+      / NULLIF(sum(coalesce(seq_scan, 0) + coalesce(idx_scan, 0)) OVER (), 0) AS read_share
+  FROM pg_stat_user_tables
+)
 SELECT
-  (n.nspname || '.' || c.relname)::text AS table_name
-  , c.relfrozenxid::text AS frozen_xid
+  (psio.schemaname || '.' || psio.relname)::text AS table_name
+  -- heap main fork only; TOAST has its own statio columns excluded from the ratio
+  , pg_relation_size(psio.relid) AS table_size_bytes
+  , ranked.reads AS reads
+  , ranked.read_rank AS read_rank
+  , ranked.read_share AS read_share
+  , CASE
+    WHEN coalesce(psio.heap_blks_hit, 0) + coalesce(psio.heap_blks_read, 0) = 0 THEN NULL
+    ELSE round(100.0 * psio.heap_blks_hit / (psio.heap_blks_hit + psio.heap_blks_read), 2)
+  END AS cache_hit_ratio
+FROM pg_statio_user_tables AS psio
+INNER JOIN ranked ON psio.relid = ranked.relid
+WHERE
+  psio.schemaname = 'public'
+  -- rank<=20 rows bypass the size floor so the top-20 ranking is verifiable at --detail debug
+  AND (pg_relation_size(psio.relid) >= 500 * 1024 * 1024 OR ranked.read_rank <= 20)
+ORDER BY pg_relation_size(psio.relid) DESC
+`
+
+type TableCacheEfficiencyRow struct {
+	TableName      pgtype.Text
+	TableSizeBytes pgtype.Int8
+	Reads          pgtype.Int8
+	ReadRank       pgtype.Int8
+	ReadShare      pgtype.Numeric
+	CacheHitRatio  pgtype.Numeric
+}
+
+// Per-table heap buffer cache hit ratios with read rank and share across all user
+// tables. Read activity is seq_scan + idx_scan; rank/share are computed before the
+// size floor so a small table still counts toward the traffic universe.
+func (q *Queries) TableCacheEfficiency(ctx context.Context) ([]TableCacheEfficiencyRow, error) {
+	rows, err := q.db.Query(ctx, tableCacheEfficiency)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []TableCacheEfficiencyRow
+	for rows.Next() {
+		var i TableCacheEfficiencyRow
+		if err := rows.Scan(
+			&i.TableName,
+			&i.TableSizeBytes,
+			&i.Reads,
+			&i.ReadRank,
+			&i.ReadShare,
+			&i.CacheHitRatio,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const tableFreezeAge = `-- name: TableFreezeAge :many
+WITH settings AS (
+  SELECT
+    coalesce(max(CASE WHEN s.name = 'autovacuum_freeze_max_age' THEN s.setting::bigint END), 200000000) AS freeze_max_age
+    , coalesce(
+      max(CASE WHEN s.name = 'autovacuum_multixact_freeze_max_age' THEN s.setting::bigint END), 400000000
+    ) AS multixact_freeze_max_age
+    , coalesce(max(CASE WHEN s.name = 'vacuum_failsafe_age' THEN s.setting::bigint END), 1600000000) AS failsafe_age
+    , coalesce(
+      max(CASE WHEN s.name = 'vacuum_multixact_failsafe_age' THEN s.setting::bigint END), 1600000000
+    ) AS multixact_failsafe_age
+  FROM pg_catalog.pg_settings AS s
+  WHERE s.name IN (
+    'autovacuum_freeze_max_age'
+    , 'autovacuum_multixact_freeze_max_age'
+    , 'vacuum_failsafe_age'
+    , 'vacuum_multixact_failsafe_age'
+  )
+)
+
+, relations AS (
+  SELECT
+    c.relkind
+    , (n.nspname || '.' || c.relname)::text AS relation_name
+    , coalesce(p.oid, c.oid) AS target_oid
+    , coalesce(pn.nspname || '.' || p.relname, n.nspname || '.' || c.relname)::text AS vacuum_target
+    , age(c.relfrozenxid)::bigint AS freeze_age
+    , CASE WHEN c.relminmxid <> '0'::xid THEN mxid_age(c.relminmxid)::bigint ELSE 0 END AS multixact_age
+    , o.xid_reloption
+    , o.multixact_reloption
+    , g.failsafe_age
+    , g.multixact_failsafe_age
+    -- A reloption can only LOWER the trigger, so the GUC is the upper bound.
+    , least(coalesce(nullif(o.xid_reloption, 0), g.freeze_max_age), g.freeze_max_age) AS effective_freeze_max_age
+    , least(coalesce(nullif(o.multixact_reloption, 0), g.multixact_freeze_max_age), g.multixact_freeze_max_age)
+      AS effective_multixact_freeze_max_age
+  FROM pg_catalog.pg_class AS c
+  INNER JOIN pg_catalog.pg_namespace AS n ON c.relnamespace = n.oid
+  CROSS JOIN settings AS g
+  LEFT JOIN pg_catalog.pg_class AS p ON c.relkind = 't' AND p.reltoastrelid = c.oid
+  LEFT JOIN pg_catalog.pg_namespace AS pn ON pn.oid = p.relnamespace
+  -- 0 means "no override": the reloption minimums are 100000 (XID) and 10000
+  -- (MultiXact), so 0 cannot collide with a real value.
+  CROSS JOIN LATERAL (
+    SELECT
+      coalesce(
+        substring(array_to_string(c.reloptions, ',') FROM 'autovacuum_freeze_max_age=(\d+)')::bigint, 0
+      ) AS xid_reloption
+      , coalesce(
+        substring(array_to_string(c.reloptions, ',') FROM 'autovacuum_multixact_freeze_max_age=(\d+)')::bigint, 0
+      ) AS multixact_reloption
+  ) AS o
+  WHERE
+    c.relkind IN ('r', 'm', 't')
+    AND c.relfrozenxid <> '0'::xid
+)
+
+, above_floor AS (
+  SELECT
+    r.relkind, r.relation_name, r.target_oid, r.vacuum_target, r.freeze_age, r.multixact_age, r.xid_reloption, r.multixact_reloption, r.failsafe_age, r.multixact_failsafe_age, r.effective_freeze_max_age, r.effective_multixact_freeze_max_age
+    -- Per-member severity, so the group can report an age and the trigger it was
+    -- measured against from the SAME member (see targets below).
+    , r.freeze_age::numeric / nullif(r.effective_freeze_max_age, 0) AS xid_ratio
+    , r.multixact_age::numeric / nullif(r.effective_multixact_freeze_max_age, 0) AS multixact_ratio
+  FROM relations AS r
+  WHERE
+    -- Floor = the LOWER of the WARN and FAIL thresholds Go will apply, never just
+    -- WARN. Go clamps WARN to the age() ceiling and caps FAIL at the failsafe, so
+    -- a high trigger can make FAIL < WARN: at a 1.2B trigger, WARN clamps to
+    -- 2147483647 and FAIL is 1.6B. Flooring at a raw 2 * trigger (2.4B) would be
+    -- unreachable and would silently discard a 1.7B relation Go would FAIL.
+    -- 4 * trigger >= 2 * trigger always, so least(2 * trigger, failsafe, ceiling)
+    -- is exactly min(clamped WARN, FAIL).
+    r.freeze_age >= least(2 * r.effective_freeze_max_age, r.failsafe_age, 2147483647)
+    OR r.multixact_age >= least(
+      2 * r.effective_multixact_freeze_max_age, r.multixact_failsafe_age, 2147483647
+    )
+)
+
+, worst_xid AS (
+  SELECT DISTINCT ON (a.target_oid)
+    a.target_oid
+    , a.freeze_age
+    , a.effective_freeze_max_age
+    , a.xid_reloption
+    , a.failsafe_age
+    , coalesce(a.xid_ratio, 0) AS xid_ratio
+  FROM above_floor AS a
+  ORDER BY a.target_oid, a.xid_ratio DESC NULLS LAST
+)
+
+, worst_multixact AS (
+  SELECT DISTINCT ON (a.target_oid)
+    a.target_oid
+    , a.multixact_age
+    , a.effective_multixact_freeze_max_age
+    , a.multixact_reloption
+    , a.multixact_failsafe_age
+    , coalesce(a.multixact_ratio, 0) AS multixact_ratio
+  FROM above_floor AS a
+  ORDER BY a.target_oid, a.multixact_ratio DESC NULLS LAST
+)
+
+, grouped AS (
+  SELECT
+    a.target_oid
+    , a.vacuum_target
+    , count(*) AS grouped_relations
+    , count(*) FILTER (WHERE a.relkind = 't') AS toast_relations
+    -- For Debug: names the relation that pulled the group in, on either counter.
+    , (array_agg(
+      a.relation_name
+      ORDER BY greatest(coalesce(a.xid_ratio, 0), coalesce(a.multixact_ratio, 0)) DESC
+    ))[1]::text AS worst_relation
+  FROM above_floor AS a
+  GROUP BY a.target_oid, a.vacuum_target
+)
+
+, targets AS (
+  SELECT
+    g.target_oid
+    , g.vacuum_target
+    , x.freeze_age
+    , x.effective_freeze_max_age
+    , x.xid_reloption
+    , x.failsafe_age
+    , m.multixact_age
+    , m.effective_multixact_freeze_max_age
+    , m.multixact_reloption
+    , m.multixact_failsafe_age
+    , g.grouped_relations
+    , g.toast_relations
+    , g.worst_relation
+    -- Counts groups, not relations.
+    , count(*) OVER () AS total_above_floor
+  FROM grouped AS g
+  INNER JOIN worst_xid AS x ON x.target_oid = g.target_oid
+  INNER JOIN worst_multixact AS m ON m.target_oid = g.target_oid
+  ORDER BY greatest(x.xid_ratio, m.multixact_ratio) DESC
+  LIMIT 50
+)
+
+SELECT
+  t.vacuum_target
+  , t.worst_relation
+  , t.grouped_relations
+  , t.toast_relations
+  , c.relkind::text AS relkind
+  , c.relpages::bigint AS relpages
+  , (c.relpages + coalesce(toast.relpages, 0) + coalesce(idx.index_pages, 0))::bigint
+    * current_setting('block_size')::bigint AS size_bytes_est
+  , t.freeze_age
+  , t.multixact_age
+  , t.effective_freeze_max_age
+  , t.effective_multixact_freeze_max_age
+  , t.failsafe_age
+  , t.multixact_failsafe_age
+  , t.xid_reloption
+  , t.multixact_reloption
   , s.last_autovacuum
   , s.last_vacuum
-  , s.autovacuum_count
-  , s.vacuum_count
-  , age(c.relfrozenxid) AS freeze_age
-  , pg_total_relation_size(c.oid) AS table_size_bytes
-FROM pg_class AS c
-INNER JOIN pg_namespace AS n ON c.relnamespace = n.oid
-LEFT JOIN pg_stat_user_tables AS s ON c.oid = s.relid
-WHERE
-  c.relkind = 'r'
-  AND n.nspname = 'public'
-  AND c.relfrozenxid != '0'
-ORDER BY age(c.relfrozenxid) DESC
-LIMIT 50
+  , coalesce(s.autovacuum_count, 0) AS autovacuum_count
+  , coalesce(s.vacuum_count, 0) AS vacuum_count
+  , t.total_above_floor
+FROM targets AS t
+INNER JOIN pg_catalog.pg_class AS c ON c.oid = t.target_oid
+LEFT JOIN pg_catalog.pg_class AS toast ON toast.oid = c.reltoastrelid
+LEFT JOIN pg_catalog.pg_stat_all_tables AS s ON s.relid = t.target_oid
+LEFT JOIN LATERAL (
+  SELECT sum(ic.relpages)::bigint AS index_pages
+  FROM pg_catalog.pg_index AS i
+  INNER JOIN pg_catalog.pg_class AS ic ON ic.oid = i.indexrelid
+  WHERE i.indrelid IN (c.oid, c.reltoastrelid)
+) AS idx ON TRUE
+ORDER BY
+  greatest(
+    t.freeze_age::numeric / nullif(t.effective_freeze_max_age, 0)
+    , t.multixact_age::numeric / nullif(t.effective_multixact_freeze_max_age, 0)
+  ) DESC
 `
 
 type TableFreezeAgeRow struct {
-	TableName       pgtype.Text
-	FrozenXid       pgtype.Text
-	LastAutovacuum  pgtype.Timestamptz
-	LastVacuum      pgtype.Timestamptz
-	AutovacuumCount pgtype.Int8
-	VacuumCount     pgtype.Int8
-	FreezeAge       pgtype.Int4
-	TableSizeBytes  pgtype.Int8
+	VacuumTarget                   string
+	WorstRelation                  string
+	GroupedRelations               int64
+	ToastRelations                 int64
+	Relkind                        string
+	Relpages                       int64
+	SizeBytesEst                   int64
+	FreezeAge                      int64
+	MultixactAge                   int64
+	EffectiveFreezeMaxAge          pgtype.Int8
+	EffectiveMultixactFreezeMaxAge pgtype.Int8
+	FailsafeAge                    pgtype.Int8
+	MultixactFailsafeAge           pgtype.Int8
+	XidReloption                   pgtype.Int8
+	MultixactReloption             pgtype.Int8
+	LastAutovacuum                 pgtype.Timestamptz
+	LastVacuum                     pgtype.Timestamptz
+	AutovacuumCount                int64
+	VacuumCount                    int64
+	TotalAboveFloor                int64
 }
 
-// Gets transaction ID age for tables with oldest frozen XIDs.
+// Freeze age per VACUUM target, grouped by target rather than relation because a
+// TOAST relation is only ever vacuumed through its parent.
+//
+// relkind IN ('r','m','t') is the exact set vac_update_datfrozenxid() counts. No
+// nspname filter, so pg_stat_all_tables is required: pg_stat_user_tables excludes
+// pg_catalog and pg_toast and would NULL out most vacuum history here.
+//
+// Size avoids pg_total_relation_size(), whose AccessShareLock queues behind a
+// *waiting* AccessExclusiveLock and would time this check out during the DDL
+// pile-up it exists to diagnose. relpages is returned so relpages = 0 (never
+// vacuumed) renders as "unknown" rather than "0 B".
+// The worst member per counter, picked whole. Reporting max(age) against
+// min(trigger) as independent aggregates would pair one member's age with
+// another's trigger and fabricate a severity no relation has: a 390M/100M parent
+// and an 800M/400M TOAST (both WARN) would combine into 800M against 100M, a
+// FAIL. DISTINCT ON keeps age, trigger and reloption from the same row — and
+// keeps them NOT NULL, which an array_agg subscript would not.
+// Joined after the LIMIT: 50 lookups, not one per relation in the database.
 func (q *Queries) TableFreezeAge(ctx context.Context) ([]TableFreezeAgeRow, error) {
 	rows, err := q.db.Query(ctx, tableFreezeAge)
 	if err != nil {
@@ -1994,14 +2669,26 @@ func (q *Queries) TableFreezeAge(ctx context.Context) ([]TableFreezeAgeRow, erro
 	for rows.Next() {
 		var i TableFreezeAgeRow
 		if err := rows.Scan(
-			&i.TableName,
-			&i.FrozenXid,
+			&i.VacuumTarget,
+			&i.WorstRelation,
+			&i.GroupedRelations,
+			&i.ToastRelations,
+			&i.Relkind,
+			&i.Relpages,
+			&i.SizeBytesEst,
+			&i.FreezeAge,
+			&i.MultixactAge,
+			&i.EffectiveFreezeMaxAge,
+			&i.EffectiveMultixactFreezeMaxAge,
+			&i.FailsafeAge,
+			&i.MultixactFailsafeAge,
+			&i.XidReloption,
+			&i.MultixactReloption,
 			&i.LastAutovacuum,
 			&i.LastVacuum,
 			&i.AutovacuumCount,
 			&i.VacuumCount,
-			&i.FreezeAge,
-			&i.TableSizeBytes,
+			&i.TotalAboveFloor,
 		); err != nil {
 			return nil, err
 		}
@@ -2018,20 +2705,35 @@ SELECT
   (n.nspname || '.' || c.relname)::text AS table_name
   , s.last_autovacuum
   , COALESCE(s.n_live_tup, c.reltuples::bigint) AS estimated_rows
-  , PG_TOTAL_RELATION_SIZE(c.oid) AS table_size_bytes
+  -- Lock-free size estimate from pg_class instead of PG_TOTAL_RELATION_SIZE(),
+  -- which takes an AccessShareLock: a new AccessShareLock request queues behind a
+  -- *waiting* AccessExclusiveLock, so it makes this check time out during a DDL
+  -- pile-up. relpages is only refreshed by VACUUM/ANALYZE, so it is stale by
+  -- definition and 0 on a never-vacuumed relation.
+  , (c.relpages + COALESCE(t.relpages, 0) + COALESCE(i.index_pages, 0))::BIGINT
+    * CURRENT_SETTING('block_size')::BIGINT AS table_size_bytes
   , COALESCE(s.n_dead_tup, 0) AS n_dead_tup
+  , COALESCE(s.vacuum_count, 0) AS vacuum_count
   , COALESCE(s.autovacuum_count, 0) AS autovacuum_count
   , ARRAY_TO_STRING(c.reloptions, ',') AS reloptions
-  , GREATEST(s.last_vacuum, s.last_autovacuum) AS last_vacuum_any
-  , GREATEST(s.last_analyze, s.last_autoanalyze) AS last_analyze_any
-  -- Stats staleness indicators
+  -- NULL means never.
+  , EXTRACT(EPOCH FROM (now() - GREATEST(s.last_vacuum, s.last_autovacuum)))::bigint AS last_vacuum_age_seconds
+  , EXTRACT(EPOCH FROM (now() - GREATEST(s.last_analyze, s.last_autoanalyze)))::bigint AS last_analyze_age_seconds
   , COALESCE(s.n_mod_since_analyze, 0) AS n_mod_since_analyze
+  , COALESCE(s.analyze_count, 0) AS analyze_count
   , COALESCE(s.autoanalyze_count, 0) AS autoanalyze_count
-  -- PG14+ columns for insert tracking (will be 0 on older versions via COALESCE)
+  -- n_ins_since_vacuum is PG14+; older versions COALESCE to 0.
   , COALESCE(s.n_ins_since_vacuum, 0) AS n_ins_since_vacuum
 FROM pg_class AS c
 INNER JOIN pg_namespace AS n ON c.relnamespace = n.oid
 LEFT JOIN pg_stat_user_tables AS s ON c.oid = s.relid
+LEFT JOIN pg_class AS t ON t.oid = c.reltoastrelid
+LEFT JOIN LATERAL (
+  SELECT SUM(ic.relpages)::BIGINT AS index_pages
+  FROM pg_index AS x
+  INNER JOIN pg_class AS ic ON ic.oid = x.indexrelid
+  WHERE x.indrelid IN (c.oid, c.reltoastrelid)
+) AS i ON TRUE
 WHERE
   c.relkind IN ('r', 'p')
   AND n.nspname = 'public'
@@ -2039,22 +2741,24 @@ ORDER BY COALESCE(s.n_live_tup, c.reltuples::bigint) DESC
 `
 
 type TableVacuumHealthRow struct {
-	TableName        pgtype.Text
-	LastAutovacuum   pgtype.Timestamptz
-	EstimatedRows    pgtype.Int8
-	TableSizeBytes   pgtype.Int8
-	NDeadTup         pgtype.Int8
-	AutovacuumCount  pgtype.Int8
-	Reloptions       pgtype.Text
-	LastVacuumAny    pgtype.Timestamptz
-	LastAnalyzeAny   pgtype.Timestamptz
-	NModSinceAnalyze pgtype.Int8
-	AutoanalyzeCount pgtype.Int8
-	NInsSinceVacuum  pgtype.Int8
+	TableName             pgtype.Text
+	LastAutovacuum        pgtype.Timestamptz
+	EstimatedRows         pgtype.Int8
+	TableSizeBytes        pgtype.Int8
+	NDeadTup              pgtype.Int8
+	VacuumCount           pgtype.Int8
+	AutovacuumCount       pgtype.Int8
+	Reloptions            pgtype.Text
+	LastVacuumAgeSeconds  pgtype.Int8
+	LastAnalyzeAgeSeconds pgtype.Int8
+	NModSinceAnalyze      pgtype.Int8
+	AnalyzeCount          pgtype.Int8
+	AutoanalyzeCount      pgtype.Int8
+	NInsSinceVacuum       pgtype.Int8
 }
 
 // Returns all tables with vacuum-related health metrics.
-// Used by multiple subchecks: autovacuum-disabled, large-table-defaults, vacuum-stale, analyze-needed.
+// Used by subchecks: autovacuum-disabled, large-table-defaults, vacuum-stale.
 func (q *Queries) TableVacuumHealth(ctx context.Context) ([]TableVacuumHealthRow, error) {
 	rows, err := q.db.Query(ctx, tableVacuumHealth)
 	if err != nil {
@@ -2070,11 +2774,13 @@ func (q *Queries) TableVacuumHealth(ctx context.Context) ([]TableVacuumHealthRow
 			&i.EstimatedRows,
 			&i.TableSizeBytes,
 			&i.NDeadTup,
+			&i.VacuumCount,
 			&i.AutovacuumCount,
 			&i.Reloptions,
-			&i.LastVacuumAny,
-			&i.LastAnalyzeAny,
+			&i.LastVacuumAgeSeconds,
+			&i.LastAnalyzeAgeSeconds,
 			&i.NModSinceAnalyze,
+			&i.AnalyzeCount,
 			&i.AutoanalyzeCount,
 			&i.NInsSinceVacuum,
 		); err != nil {
@@ -2095,15 +2801,16 @@ WITH temp_stats AS (
     , temp_files
     , temp_bytes
     , stats_reset
-    , EXTRACT(EPOCH FROM (NOW() - stats_reset)) AS seconds_since_reset
+    , (stats_reset IS NULL) AS window_is_lower_bound
+    , EXTRACT(EPOCH FROM (NOW() - coalesce(stats_reset, pg_postmaster_start_time()))) AS seconds_since_reset
     , CASE
-      WHEN EXTRACT(EPOCH FROM (NOW() - stats_reset)) > 0
-        THEN temp_files::numeric / (EXTRACT(EPOCH FROM (NOW() - stats_reset)) / 3600)
+      WHEN EXTRACT(EPOCH FROM (NOW() - coalesce(stats_reset, pg_postmaster_start_time()))) > 0
+        THEN temp_files::numeric / (EXTRACT(EPOCH FROM (NOW() - coalesce(stats_reset, pg_postmaster_start_time()))) / 3600)
       ELSE 0
     END AS temp_files_per_hour
     , CASE
-      WHEN EXTRACT(EPOCH FROM (NOW() - stats_reset)) > 0
-        THEN temp_bytes::numeric / (EXTRACT(EPOCH FROM (NOW() - stats_reset)) / 3600)
+      WHEN EXTRACT(EPOCH FROM (NOW() - coalesce(stats_reset, pg_postmaster_start_time()))) > 0
+        THEN temp_bytes::numeric / (EXTRACT(EPOCH FROM (NOW() - coalesce(stats_reset, pg_postmaster_start_time()))) / 3600)
       ELSE 0
     END AS temp_bytes_per_hour
   FROM pg_stat_database
@@ -2139,6 +2846,7 @@ SELECT
   , ts.temp_files
   , ts.temp_bytes
   , ts.stats_reset
+  , ts.window_is_lower_bound
   , ts.seconds_since_reset
   , ms.work_mem
   , ms.temp_file_limit
@@ -2152,21 +2860,28 @@ CROSS JOIN memory_settings AS ms
 `
 
 type TempUsageRow struct {
-	DatabaseName      pgtype.Text
-	TempFiles         pgtype.Int8
-	TempBytes         pgtype.Int8
-	StatsReset        pgtype.Timestamptz
-	SecondsSinceReset pgtype.Numeric
-	WorkMem           pgtype.Text
-	TempFileLimit     pgtype.Text
-	LogTempFiles      pgtype.Text
-	MaxConnections    pgtype.Text
-	SharedBuffers     pgtype.Text
-	TempFilesPerHour  pgtype.Numeric
-	TempBytesPerHour  pgtype.Numeric
+	DatabaseName       pgtype.Text
+	TempFiles          pgtype.Int8
+	TempBytes          pgtype.Int8
+	StatsReset         pgtype.Timestamptz
+	WindowIsLowerBound pgtype.Bool
+	SecondsSinceReset  pgtype.Numeric
+	WorkMem            pgtype.Text
+	TempFileLimit      pgtype.Text
+	LogTempFiles       pgtype.Text
+	MaxConnections     pgtype.Text
+	SharedBuffers      pgtype.Text
+	TempFilesPerHour   pgtype.Numeric
+	TempBytesPerHour   pgtype.Numeric
 }
 
 // Monitors temporary file creation indicating work_mem exhaustion
+// Most databases have never had pg_stat_reset() called, so stats_reset is NULL and
+// there is no recorded start for the window. The counters are still accumulating
+// normally, so fall back to the server start time: a clean restart preserves them
+// (PG15+), and the events that do zero them - crash, unclean shutdown, a rebuilt
+// replica - all coincide with a start. The true window is therefore at least the
+// uptime, which makes the rates below upper bounds rather than exact.
 func (q *Queries) TempUsage(ctx context.Context) (TempUsageRow, error) {
 	row := q.db.QueryRow(ctx, tempUsage)
 	var i TempUsageRow
@@ -2175,6 +2890,7 @@ func (q *Queries) TempUsage(ctx context.Context) (TempUsageRow, error) {
 		&i.TempFiles,
 		&i.TempBytes,
 		&i.StatsReset,
+		&i.WindowIsLowerBound,
 		&i.SecondsSinceReset,
 		&i.WorkMem,
 		&i.TempFileLimit,
@@ -2185,6 +2901,114 @@ func (q *Queries) TempUsage(ctx context.Context) (TempUsageRow, error) {
 		&i.TempBytesPerHour,
 	)
 	return i, err
+}
+
+const tempUsageAttributionGap = `-- name: TempUsageAttributionGap :one
+SELECT
+  (SELECT s.setting FROM pg_catalog.pg_settings AS s WHERE s.name = 'statement_timeout') AS statement_timeout
+  , (SELECT s.setting FROM pg_catalog.pg_settings AS s WHERE s.name = 'pg_stat_statements.track') AS track
+  , (SELECT s.setting FROM pg_catalog.pg_settings AS s WHERE s.name = 'pg_stat_statements.track_utility') AS track_utility
+  , (SELECT s.setting FROM pg_catalog.pg_settings AS s WHERE s.name = 'pg_stat_statements.max') AS max_entries
+  , (SELECT s.setting FROM pg_catalog.pg_settings AS s WHERE s.name = 'log_temp_files') AS log_temp_files
+  , (SELECT i.dealloc FROM pg_stat_statements_info AS i) AS evictions
+`
+
+type TempUsageAttributionGapRow struct {
+	StatementTimeout pgtype.Text
+	Track            pgtype.Text
+	TrackUtility     pgtype.Text
+	MaxEntries       pgtype.Text
+	LogTempFiles     pgtype.Text
+	Evictions        pgtype.Int8
+}
+
+// Explains why no statement accounts for the temp files. Read only when the
+// attribution query came back empty, so it deliberately avoids pg_stat_statements
+// itself: that view materialises its whole query-text corpus on every read.
+func (q *Queries) TempUsageAttributionGap(ctx context.Context) (TempUsageAttributionGapRow, error) {
+	row := q.db.QueryRow(ctx, tempUsageAttributionGap)
+	var i TempUsageAttributionGapRow
+	err := row.Scan(
+		&i.StatementTimeout,
+		&i.Track,
+		&i.TrackUtility,
+		&i.MaxEntries,
+		&i.LogTempFiles,
+		&i.Evictions,
+	)
+	return i, err
+}
+
+const tempUsageByStatement = `-- name: TempUsageByStatement :many
+SELECT
+  s.queryid
+  , s.calls
+  , s.temp_blks_written * current_setting('block_size')::bigint AS temp_bytes_written
+  , (to_jsonb(s) ->> 'stats_since')::timestamptz AS entry_since
+  , left(regexp_replace(s.query, '\s+', ' ', 'g'), 300) AS query_text
+FROM pg_stat_statements AS s
+WHERE
+  s.dbid = (SELECT d.oid FROM pg_catalog.pg_database AS d WHERE d.datname = current_database())
+  AND s.toplevel
+  AND s.temp_blks_written > 0
+  -- Reading pg_stat_statements spills its own query-text corpus to disk, so
+  -- pgdoctor turns up in its own results. sqlc stamps every query pgdoctor issues
+  -- with this marker; blaming the diagnostic for the symptom helps nobody.
+  AND s.query NOT LIKE '-- name:%' 
+ORDER BY s.temp_blks_written DESC
+LIMIT 10
+`
+
+type TempUsageByStatementRow struct {
+	Queryid          pgtype.Int8
+	Calls            pgtype.Int8
+	TempBytesWritten pgtype.Int8
+	EntrySince       pgtype.Timestamptz
+	QueryText        pgtype.Text
+}
+
+// Attributes temp file writes to individual statements. Rank by this, never sum it:
+// it counts write I/O, and a multi-pass external sort rewrites the same file, so it
+// exceeds the disk footprint pg_stat_database.temp_bytes measures.
+// toplevel drops the duplicate rows pg_stat_statements.track = 'all' creates.
+// stats_since is when the entry was created, not when the statement last ran; read
+// via to_jsonb so one statement works on PG15/16, where the column does not exist.
+func (q *Queries) TempUsageByStatement(ctx context.Context) ([]TempUsageByStatementRow, error) {
+	rows, err := q.db.Query(ctx, tempUsageByStatement)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []TempUsageByStatementRow
+	for rows.Next() {
+		var i TempUsageByStatementRow
+		if err := rows.Scan(
+			&i.Queryid,
+			&i.Calls,
+			&i.TempBytesWritten,
+			&i.EntrySince,
+			&i.QueryText,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const toastDefaultCompression = `-- name: ToastDefaultCompression :one
+SELECT current_setting('default_toast_compression', true)::text AS default_toast_compression
+`
+
+// PG14+ GUC; the safe form returns NULL where it does not exist.
+func (q *Queries) ToastDefaultCompression(ctx context.Context) (string, error) {
+	row := q.db.QueryRow(ctx, toastDefaultCompression)
+	var default_toast_compression string
+	err := row.Scan(&default_toast_compression)
+	return default_toast_compression, err
 }
 
 const toastStorage = `-- name: ToastStorage :many
@@ -2214,29 +3038,6 @@ WITH toast_info AS (
     AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
     AND c.reltoastrelid != 0
     AND pg_relation_size(t.oid) > 1048576  -- TOAST > 1MB
-)
-
-, wide_columns AS (
-  SELECT
-    ps.schemaname::text AS schema_name
-    , ps.tablename::text AS table_name
-    , ps.attname::text AS column_name
-    , ps.avg_width
-    , CASE
-      WHEN pt.typname IN ('json', 'jsonb') THEN 'jsonb'
-      WHEN pt.typname IN ('text', 'varchar', 'char', 'bpchar') THEN 'text'
-      WHEN pt.typname = 'bytea' THEN 'bytea'
-      ELSE 'other'
-    END AS column_category
-  FROM pg_stats AS ps
-  INNER JOIN pg_class AS c ON ps.tablename = c.relname
-  INNER JOIN pg_namespace AS n ON c.relnamespace = n.oid AND ps.schemaname = n.nspname
-  INNER JOIN pg_attribute AS pa ON c.oid = pa.attrelid AND ps.attname = pa.attname
-  INNER JOIN pg_type AS pt ON pa.atttypid = pt.oid
-  WHERE
-    ps.schemaname NOT IN ('pg_catalog', 'information_schema')
-    AND ps.avg_width > 2000  -- Likely using TOAST (threshold ~2KB)
-    AND ps.avg_width IS NOT NULL
 )
 
 , column_compression AS (
@@ -2282,14 +3083,6 @@ SELECT
   , ti.toast_dead_tuples
   , coalesce(
     (
-      SELECT array_agg(wc.column_name || ':' || wc.avg_width::text || ':' || wc.column_category ORDER BY wc.avg_width DESC)
-      FROM wide_columns AS wc
-      WHERE wc.schema_name = ti.schema_name AND wc.table_name = ti.table_name
-    )
-    , ARRAY[]::text []
-  ) AS wide_columns
-  , coalesce(
-    (
       SELECT
         array_agg(
           cc.column_name || ':' || cc.compression_algorithm || ':' || cc.storage_strategy || ':' || cc.column_type
@@ -2300,6 +3093,7 @@ SELECT
     )
     , ARRAY[]::text []
   ) AS column_compression_info
+  -- PG14+ GUC; safe form returns NULL on PG13 where it does not exist
 FROM toast_info AS ti
 ORDER BY ti.toast_size DESC
 `
@@ -2315,7 +3109,6 @@ type ToastStorageRow struct {
 	ToastPercent          pgtype.Numeric
 	ToastLiveTuples       pgtype.Int8
 	ToastDeadTuples       pgtype.Int8
-	WideColumns           []string
 	ColumnCompressionInfo []string
 }
 
@@ -2340,7 +3133,6 @@ func (q *Queries) ToastStorage(ctx context.Context) ([]ToastStorageRow, error) {
 			&i.ToastPercent,
 			&i.ToastLiveTuples,
 			&i.ToastDeadTuples,
-			&i.WideColumns,
 			&i.ColumnCompressionInfo,
 		); err != nil {
 			return nil, err

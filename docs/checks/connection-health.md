@@ -125,17 +125,19 @@ Idle-in-transaction connections:
 
 ### long-idle
 
-Detects connections that have been idle for >30 minutes.
+Counts connections idle for more than 1 hour. One hour is the point past the usual `idle_session_timeout`
+backstop, so anything still idle beyond it is genuinely unreaped.
 
 **Thresholds:**
-- Warning: ≥10 connections idle >30 minutes
-- Critical: ≥50 connections idle >30 minutes
+- Warning: more than 100 connections idle over 1 hour
+- Critical: more than 500 connections idle over 1 hour
 
-**What it means:**
-Long-idle connections may indicate:
-- Connection leak (app not returning connections)
-- Oversized minimum pool size
-- Abandoned connections from crashed clients
+**Why it matters:**
+Every idle connection still holds a `max_connections` slot, so a growing population of them starves new
+sessions while doing no work. Pooled fleets keep a warm floor of idle connections *by design* — PgBouncer's
+`min_pool_size` holds spare backends open so bursts don't pay reconnect latency — so a modest steady count
+is healthy. The leak signal is a count far above any configured floor, and a true leak is confirmed when it
+keeps climbing across runs instead of resting steady.
 
 ## How to Fix
 
@@ -218,10 +220,9 @@ WHERE state = 'idle in transaction'
   AND query_start < NOW() - INTERVAL '5 minutes';
 
 # Step 3: Kill stuck connections (if timeout doesn't work)
-SELECT pg_terminate_backend(pid)
-FROM pg_stat_activity
-WHERE state = 'idle in transaction'
-  AND query_start < NOW() - INTERVAL '10 minutes';
+# One PID at a time, verified from the query above. Never run a set-valued
+# pg_terminate_backend() against a live primary.
+SELECT pg_terminate_backend(12345); -- one PID, verified from the query above
 
 # Step 4: Fix application code
 # Common causes:
@@ -235,18 +236,17 @@ WHERE state = 'idle in transaction'
 Fix connection leaks in application:
 
 ```bash
-# Step 1: Identify leaked connections
+# Step 1: Identify the source apps holding idle connections
 SELECT pid, usename, application_name, state_change, query
 FROM pg_stat_activity
 WHERE state = 'idle'
-  AND state_change < NOW() - INTERVAL '30 minutes'
+  AND state_change < NOW() - INTERVAL '1 hour'
 ORDER BY state_change;
 
 # Step 2: Kill old idle connections
-SELECT pg_terminate_backend(pid)
-FROM pg_stat_activity
-WHERE state = 'idle'
-  AND state_change < NOW() - INTERVAL '1 hour';
+# One PID at a time, verified from the query above. Never run a set-valued
+# pg_terminate_backend() against a live primary.
+SELECT pg_terminate_backend(12345); -- one PID, verified from the query above
 
 # Step 3: Enable connection timeout
 # For PgBouncer:
@@ -260,6 +260,7 @@ SELECT pg_reload_conf();
 # Ensure connections are returned to pool properly
 # Check for:
 # - Missing connection.close() in error handlers
+# - Connections not released on error paths or process exit / shutdown
 # - Connection pool exhaustion causing app to hold connections
 # - Long-running background jobs not releasing connections
 ```
@@ -279,12 +280,14 @@ Connection problems?
 │       └─► Without PgBouncer: Add PgBouncer or optimize queries
 │
 ├─► "Connections mostly idle"
-│   └─► Check: idle-ratio + connection-efficiency busy-ratio
+│   └─► Check: idle-ratio
 │       └─► Reduce pool size (save memory)
 │
 ├─► "Locks / blocked queries"
-│   └─► Check: idle-in-transaction
-│       └─► Fix application transaction handling
+│   └─► Run: houston dba xmin
+│       └─► Identify what pins the xmin horizon (long transaction,
+│           replication slot, prepared transaction), then act on that
+│           single object
 │
 └─► "Connection count growing over time"
     └─► Check: long-idle
@@ -327,7 +330,7 @@ Configuration lives in each service's source code (ORM settings). Consult your O
 
 ## Related Checks
 
-- **connection-efficiency** - Analyzes historical session statistics (PostgreSQL 14+): busy ratio trends and abnormal termination patterns
+- **connection-efficiency** - Analyzes historical session statistics (PostgreSQL 14+): abnormal session termination patterns
 - **session-settings** - Validates timeout configurations that affect connection behavior
 
 ## References

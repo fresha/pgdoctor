@@ -5,9 +5,11 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"strings"
 
 	"github.com/fresha/pgdoctor/check"
 	"github.com/fresha/pgdoctor/db"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 //go:embed query.sql
@@ -16,9 +18,17 @@ var querySQL string
 //go:embed README.md
 var readme string
 
+// Below an hour a single query's temp file skews the rate into the FAIL band.
+const minWindowSeconds = 3600
+
 // TempUsageQueries defines the database queries needed by this check.
+// HasPgStatStatements is generated from partition-usage's query.sql: sqlc query
+// names are global to the shared db package, so it is declared, not redefined.
 type TempUsageQueries interface {
 	TempUsage(context.Context) (db.TempUsageRow, error)
+	HasPgStatStatements(context.Context) (pgtype.Bool, error)
+	TempUsageByStatement(context.Context) ([]db.TempUsageByStatementRow, error)
+	TempUsageAttributionGap(context.Context) (db.TempUsageAttributionGapRow, error)
 }
 
 type checker struct {
@@ -54,31 +64,218 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 		return nil, fmt.Errorf("running %s/%s: %w", check.CategoryConfigs, report.CheckID, err)
 	}
 
-	// Check if we have enough data (at least 1 hour since stats reset)
-	secondsSinceReset := getSecondsSinceReset(row)
-	if secondsSinceReset < 3600 {
-		report.AddFinding(check.Finding{
-			ID:       report.CheckID,
-			Name:     report.Name,
-			Severity: check.SeverityOK,
-			Details:  fmt.Sprintf("Statistics reset too recently (%.0f minutes ago). Need at least 1 hour of data.", secondsSinceReset/60),
-		})
-		return report, nil
+	// Skip rather than pass: PASS would read as "no temp file problem", which too
+	// short a window cannot establish.
+	window, windowKnown := statsWindowSeconds(row)
+	switch {
+	case !windowKnown:
+		return skip(report, "Counter window unknown; temp file rates cannot be computed."), nil
+	case window < minWindowSeconds:
+		return skip(report, fmt.Sprintf(
+			"Counters cover only %s; need at least 1h of data to compute temp file rates.",
+			check.FormatDurationSec(int64(window)),
+		)), nil
 	}
 
-	// Run all subchecks
-	checkTempFileRate(row, report)
-	checkTempVolumeRate(row, report)
+	// Anchored to uptime, the window is a lower bound and the rates upper bounds:
+	// one above the threshold may be a long history over a short uptime.
+	maxSeverity := check.SeverityFail
+	if row.WindowIsLowerBound.Bool {
+		maxSeverity = check.SeverityWarn
+	}
+
+	// Graded separately, reported together: a high volume at a low file count is a
+	// few enormous spills, the reverse is many small ones.
+	rateSeverity := worst(tempFileRateSeverity(row, maxSeverity), tempVolumeRateSeverity(row, maxSeverity))
+
+	details := ""
+
+	if rateSeverity > check.SeverityPass {
+		// Reading pg_stat_statements materialises its whole query-text corpus into
+		// a work_mem tuplestore, so a healthy database does not pay for it.
+		gap, err := c.reportTopStatements(ctx, report, rateSeverity)
+		if err != nil {
+			return nil, err
+		}
+
+		details = tempTotals(row, window)
+		if gap != "" {
+			details += "\n\n" + gap
+		}
+	}
+
+	reportTempRate(row, report, rateSeverity, details)
 
 	return report, nil
 }
 
-func getSecondsSinceReset(row db.TempUsageRow) float64 {
-	if !row.SecondsSinceReset.Valid {
-		return 0
+func worst(a, b check.Severity) check.Severity {
+	if a > b {
+		return a
 	}
-	f, _ := row.SecondsSinceReset.Float64Value()
-	return f.Float64
+
+	return b
+}
+
+// reportTopStatements attributes temp writes to statements, returning why it could
+// not when it could not. The figures rank; they do not sum. pg_stat_database
+// measures disk footprint, pg_stat_statements write I/O, which a multi-pass sort
+// repeats.
+func (c *checker) reportTopStatements(ctx context.Context, report *check.Report, severity check.Severity) (string, error) {
+	available, err := c.queries.HasPgStatStatements(ctx)
+	if err != nil {
+		return "", fmt.Errorf("running %s/%s: %w", report.Category, report.CheckID, err)
+	}
+
+	if !available.Bool {
+		return "pg_stat_statements is not available, so nothing can be attributed.", nil
+	}
+
+	statements, err := c.queries.TempUsageByStatement(ctx)
+	if err != nil {
+		return "", fmt.Errorf("running %s/%s: %w", report.Category, report.CheckID, err)
+	}
+
+	if len(statements) == 0 {
+		gap, err := c.queries.TempUsageAttributionGap(ctx)
+		if err != nil {
+			return "", fmt.Errorf("running %s/%s: %w", report.Category, report.CheckID, err)
+		}
+
+		return explainAttributionGap(gap), nil
+	}
+
+	rows := make([]check.TableRow, 0, len(statements))
+	for _, statement := range statements {
+		rows = append(rows, check.TableRow{
+			Cells: []string{
+				check.FormatBytes(statement.TempBytesWritten.Int64),
+				check.FormatNumber(statement.Calls.Int64),
+				entrySince(statement.EntrySince),
+				fmt.Sprintf("%d", statement.Queryid.Int64),
+				clipQueryText(statement.QueryText.String),
+			},
+			Severity: check.SeverityInfo,
+		})
+	}
+
+	report.AddFinding(check.Finding{
+		ID:       "temp-file-sources",
+		Name:     fmt.Sprintf("Statements Spilling To Disk: %d", len(rows)),
+		Severity: severity,
+		Details: fmt.Sprintf(
+			"Top %d by temp write volume, which counts rewrites and so will not sum to the totals reported by the rate.",
+			len(rows)),
+		Table: &check.Table{
+			Headers: []string{"Temp Written", "Calls", "Tracked Since", "Query ID", "Query"},
+			Rows:    rows,
+		},
+	})
+
+	return "", nil
+}
+
+// explainAttributionGap names why pg_stat_statements holds no temp writes while the
+// counters do. Several usually apply at once.
+func explainAttributionGap(gap db.TempUsageAttributionGapRow) string {
+	var reasons []string
+
+	if gap.StatementTimeout.String != "0" && gap.StatementTimeout.String != "" {
+		reasons = append(reasons, fmt.Sprintf(
+			"statements killed by statement_timeout=%sms are never recorded", gap.StatementTimeout.String))
+	}
+
+	if gap.Evictions.Int64 > 0 {
+		reasons = append(reasons, fmt.Sprintf(
+			"%s evictions at max=%s drop infrequent statements",
+			check.FormatNumber(gap.Evictions.Int64), gap.MaxEntries.String))
+	}
+
+	if gap.TrackUtility.String == "off" {
+		reasons = append(reasons, "track_utility is off, so index builds are not recorded")
+	}
+
+	if gap.Track.String == "none" {
+		reasons = append(reasons, "pg_stat_statements.track is none, so nothing is recorded")
+	}
+
+	// log_temp_files = -1 disables it; anything else logs files at or above that size.
+	next := "Set log_temp_files to catch them."
+	if gap.LogTempFiles.String != "-1" && gap.LogTempFiles.String != "" {
+		next = "The server log has them (log_temp_files is on)."
+	}
+
+	if len(reasons) == 0 {
+		return "No statement accounts for this.\n\n" + next
+	}
+
+	return fmt.Sprintf("No statement accounts for this:\n%s\n\n%s", strings.Join(reasons, "\n"), next)
+}
+
+// entrySince is when the entry was created, not when the statement last ran: there
+// is no last-execution column in any version. Absent before PostgreSQL 17.
+func entrySince(ts pgtype.Timestamptz) string {
+	if !ts.Valid {
+		return "-"
+	}
+
+	return ts.Time.Format("2006-01-02")
+}
+
+// clipQueryText shortens a normalized statement to one terminal line, counting runes
+// so a multi-byte identifier is never split mid-character.
+func clipQueryText(text string) string {
+	const maxLen = 60
+
+	runes := []rune(text)
+	if len(runes) <= maxLen {
+		return text
+	}
+
+	return string(runes[:maxLen-1]) + "…"
+}
+
+// capSeverity holds a rate-derived severity to what the window can actually support.
+func capSeverity(severity, ceiling check.Severity) check.Severity {
+	if severity > ceiling {
+		return ceiling
+	}
+
+	return severity
+}
+
+// skip marks the whole report unrunnable. The runner injects SeveritySkip when
+// Check returns an error, but an unusable stats window is not an error: the query
+// succeeded and simply carried nothing to measure over. Setting it here keeps our
+// own wording instead of surfacing a raw error string. AddFinding only raises
+// severity, so the assignment has to follow it.
+func skip(report *check.Report, reason string) *check.Report {
+	report.AddFinding(check.Finding{
+		ID:       report.CheckID,
+		Name:     report.Name,
+		Severity: check.SeveritySkip,
+		Details:  reason,
+	})
+	report.Severity = check.SeveritySkip
+
+	return report
+}
+
+// statsWindowSeconds reports how long the counters have been accumulating, and
+// whether that period is known at all. A NULL stats_reset does not mean "since the
+// beginning of time": an unclean shutdown or a fresh replica also zeroes the
+// counters, and neither records a timestamp.
+func statsWindowSeconds(row db.TempUsageRow) (float64, bool) {
+	if !row.SecondsSinceReset.Valid {
+		return 0, false
+	}
+
+	f, err := row.SecondsSinceReset.Float64Value()
+	if err != nil || !f.Valid {
+		return 0, false
+	}
+
+	return f.Float64, true
 }
 
 func getTempFilesPerHour(row db.TempUsageRow) float64 {
@@ -97,22 +294,16 @@ func getTempBytesPerHour(row db.TempUsageRow) float64 {
 	return f.Float64
 }
 
-// checkTempFileRate identifies high temp file creation rates.
+// tempFileRateSeverity grades the temp file creation rate.
 // Thresholds are tuned for production scale based on observed baselines (~0.3 files/hour).
 // These catch regressions (query plan changes, work_mem resets) rather than absolute badness.
-func checkTempFileRate(row db.TempUsageRow, report *check.Report) {
+func tempFileRateSeverity(row db.TempUsageRow, maxSeverity check.Severity) check.Severity {
 	rate := getTempFilesPerHour(row)
 
 	// Threshold: 5 files/hour is ~20x typical production baseline
 	// Indicates: New inefficient queries, query plan regression, or work_mem issues
 	if rate < 5 {
-		report.AddFinding(check.Finding{
-			ID:       "temp-file-rate",
-			Name:     "Temp File Creation Rate",
-			Severity: check.SeverityOK,
-			Details:  fmt.Sprintf("Temp file creation rate is acceptable: %.1f files/hour", rate),
-		})
-		return
+		return check.SeverityPass
 	}
 
 	severity := check.SeverityWarn
@@ -122,28 +313,27 @@ func checkTempFileRate(row db.TempUsageRow, report *check.Report) {
 		severity = check.SeverityFail
 	}
 
-	var statsResetInfo string
-	if row.StatsReset.Valid {
-		statsResetInfo = fmt.Sprintf(" (since %s)", row.StatsReset.Time.Format("2006-01-02"))
-	}
-
-	report.AddFinding(check.Finding{
-		ID:       "temp-file-rate",
-		Name:     "Temp File Creation Rate",
-		Severity: severity,
-		Details: fmt.Sprintf(
-			"High temp file creation rate: %.1f files/hour%s\n\nTotal temp files: %d\nTotal temp data: %s",
-			rate, statsResetInfo,
-			row.TempFiles.Int64,
-			check.FormatBytes(row.TempBytes.Int64),
-		),
-	})
+	return capSeverity(severity, maxSeverity)
 }
 
-// checkTempVolumeRate identifies high temp data volume.
+// tempTotals is the volume behind the rates: the rate alone cannot say whether it
+// came from a long quiet accumulation or a short violent one. It always states the
+// period, since a cumulative total without one says nothing. With no recorded reset
+// the period is the server uptime, which is a lower bound on the real one.
+func tempTotals(row db.TempUsageRow, window float64) string {
+	period := fmt.Sprintf("over at least %s", check.FormatDurationSec(int64(window)))
+	if row.StatsReset.Valid {
+		period = fmt.Sprintf("since %s", row.StatsReset.Time.Format("2006-01-02"))
+	}
+
+	return fmt.Sprintf("%s files totalling %s, %s.",
+		check.FormatNumber(row.TempFiles.Int64), check.FormatBytes(row.TempBytes.Int64), period)
+}
+
+// tempVolumeRateSeverity grades the temp data volume.
 // Thresholds are tuned for production scale based on observed baselines (~124MB/hour).
 // These catch significant increases in disk spilling rather than absolute usage.
-func checkTempVolumeRate(row db.TempUsageRow, report *check.Report) {
+func tempVolumeRateSeverity(row db.TempUsageRow, maxSeverity check.Severity) check.Severity {
 	const oneGB = float64(1024 * 1024 * 1024)
 	const fiveGB = float64(5 * 1024 * 1024 * 1024)
 
@@ -152,13 +342,7 @@ func checkTempVolumeRate(row db.TempUsageRow, report *check.Report) {
 	// Threshold: 1GB/hour is ~8x typical production baseline
 	// Indicates: Increased large sorts/hashes, possibly from new features or query changes
 	if bytesPerHour < oneGB {
-		report.AddFinding(check.Finding{
-			ID:       "temp-volume-rate",
-			Name:     "Temp Data Volume Rate",
-			Severity: check.SeverityOK,
-			Details:  fmt.Sprintf("Temp data volume is acceptable: %s/hour", check.FormatBytes(int64(bytesPerHour))),
-		})
-		return
+		return check.SeverityPass
 	}
 
 	severity := check.SeverityWarn
@@ -168,13 +352,19 @@ func checkTempVolumeRate(row db.TempUsageRow, report *check.Report) {
 		severity = check.SeverityFail
 	}
 
+	return capSeverity(severity, maxSeverity)
+}
+
+// reportTempRate carries both numbers on one finding. They are graded apart but read
+// together: the volume divided by the file count is the average spill size, which is
+// what separates a few enormous sorts from a flood of small ones. Reporting them as
+// two findings made one condition look like two problems.
+func reportTempRate(row db.TempUsageRow, report *check.Report, severity check.Severity, details string) {
 	report.AddFinding(check.Finding{
-		ID:       "temp-volume-rate",
-		Name:     "Temp Data Volume Rate",
+		ID: "temp-rate",
+		Name: fmt.Sprintf("Temp File Rate: %.1f files/hour, %s/hour",
+			getTempFilesPerHour(row), check.FormatBytes(int64(getTempBytesPerHour(row)))),
 		Severity: severity,
-		Details: fmt.Sprintf(
-			"High temp data volume: %s/hour\n\nThis causes significant disk I/O and slows queries.",
-			check.FormatBytes(int64(bytesPerHour)),
-		),
+		Details:  details,
 	})
 }

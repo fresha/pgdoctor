@@ -6,26 +6,24 @@ Analyzes index usage patterns to identify unused and inefficient indexes that wa
 
 ## What It Checks
 
-### 1. Unused Indexes
-Indexes with zero scans that are larger than 10 MB. These indexes consume disk space and add overhead to INSERT/UPDATE/DELETE operations without providing query benefits.
+### Unused Indexes (`unused-indexes`)
+Indexes with zero scans that are larger than 500 MB. These indexes consume disk space and add overhead to
+INSERT/UPDATE/DELETE operations without providing query benefits.
+Details disclose the statistics window (since `pg_stat_database.stats_reset`) so "0 scans" is interpretable.
 
-**Severity**: FAIL
+**Severity**: WARN
 
 **Excludes**:
 - Primary keys (required for constraints)
 - Unique indexes (enforce data integrity)
 
-### 2. Low Usage Indexes
-Indexes with fewer than 1,000 scans but more than 10,000 table writes. These indexes have high maintenance costs relative to their query benefits.
+### Low Usage Indexes (`low-usage-indexes`)
+Indexes larger than 500 MB with more than 10,000 table writes and at least one scan but a sustained rate
+below 1 per week, over a statistics window of at least 30 days. The window is measured by the server, so the
+clock on the host running pgdoctor does not affect which indexes are listed. Zero-scan indexes surface as unused-indexes.
+These indexes have high maintenance costs relative to their query benefits.
 
-**Severity**: WARN
-
-### 3. Index Cache Efficiency
-Indexes with low buffer cache hit ratios, indicating frequent disk I/O:
-- FAIL: < 90% cache hit ratio on indexes > 100 MB
-- WARN: < 95% cache hit ratio on indexes > 10 MB
-
-**Severity**: WARN or FAIL
+**Severity**: INFO
 
 ## Statistics Requirements
 
@@ -82,21 +80,6 @@ Consider if these indexes are:
 
 Evaluate index value vs maintenance cost for your workload.
 
-### For `index-cache-ratio`
-
-Low cache hit ratio means frequent disk I/O.
-
-**Options to improve:**
-1. Increase `shared_buffers` (if memory available)
-2. Consider partial indexes to reduce size
-3. Review query patterns - may be scanning too much data
-4. If index is unused, consider dropping it
-
-```sql
--- Check current shared_buffers
-SHOW shared_buffers;
-```
-
 ## Query Details
 
-Queries `pg_stat_user_indexes`, `pg_statio_user_indexes`, `pg_stat_user_tables`, and `pg_stat_database` for comprehensive usage analysis.
+Queries `pg_stat_user_indexes`, `pg_stat_user_tables`, and `pg_stat_database` for comprehensive usage analysis.

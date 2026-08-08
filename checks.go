@@ -9,6 +9,7 @@ import (
 	"github.com/fresha/pgdoctor/checks/connectionefficiency"
 	"github.com/fresha/pgdoctor/checks/connectionhealth"
 	"github.com/fresha/pgdoctor/checks/duplicateindexes"
+	"github.com/fresha/pgdoctor/checks/extensionversions"
 	"github.com/fresha/pgdoctor/checks/freezeage"
 	"github.com/fresha/pgdoctor/checks/indexbloat"
 	"github.com/fresha/pgdoctor/checks/indexusage"
@@ -17,6 +18,7 @@ import (
 	"github.com/fresha/pgdoctor/checks/partitionusage"
 	"github.com/fresha/pgdoctor/checks/pgversion"
 	"github.com/fresha/pgdoctor/checks/pktypes"
+	"github.com/fresha/pgdoctor/checks/querystatscapacity"
 	"github.com/fresha/pgdoctor/checks/replicationlag"
 	"github.com/fresha/pgdoctor/checks/replicationslots"
 	"github.com/fresha/pgdoctor/checks/sequencehealth"
@@ -60,6 +62,12 @@ func AllChecks() []check.Package {
 			Metadata: duplicateindexes.Metadata,
 			New: func(conn db.DBTX, cfg check.Config) check.Checker {
 				return duplicateindexes.New(db.New(conn), cfg)
+			},
+		},
+		{
+			Metadata: extensionversions.Metadata,
+			New: func(conn db.DBTX, cfg check.Config) check.Checker {
+				return extensionversions.New(db.New(conn), cfg)
 			},
 		},
 		{
@@ -108,6 +116,12 @@ func AllChecks() []check.Package {
 			Metadata: pktypes.Metadata,
 			New: func(conn db.DBTX, cfg check.Config) check.Checker {
 				return pktypes.New(db.New(conn), cfg)
+			},
+		},
+		{
+			Metadata: querystatscapacity.Metadata,
+			New: func(conn db.DBTX, cfg check.Config) check.Checker {
+				return querystatscapacity.New(db.New(conn), cfg)
 			},
 		},
 		{

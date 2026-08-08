@@ -8,8 +8,7 @@ PostgreSQL's autovacuum maintains table health by removing dead tuples, updating
 
 - Disabled autovacuum settings
 - Default configurations unsuitable for large tables
-- Stale vacuum/analyze activity
-- Excessive modifications without ANALYZE
+- Stale vacuum/analyze activity with real pending work
 
 ## Subchecks
 
@@ -27,9 +26,7 @@ These tables rely entirely on manual maintenance. Common legitimate uses:
 
 Identifies tables with more than 1 million rows using default autovacuum scale factors.
 
-**Severity:**
-- Warning: Tables with 1M-10M rows
-- Fail: Tables with >10M rows
+**Severity:** Warning
 
 The default `autovacuum_vacuum_scale_factor` is 0.2 (20%), meaning autovacuum triggers when dead tuples exceed 20% of the table size:
 
@@ -50,39 +47,28 @@ ALTER TABLE schema.large_table SET (
 
 ### vacuum-stale
 
-Identifies tables that haven't been vacuumed or analyzed recently.
+Identifies tables that haven't been vacuumed or analyzed recently despite pending work.
 
 **Severity:**
-- Warning: No vacuum/analyze in 7+ days
-- Fail: No vacuum/analyze in 25+ days
+- Warning: No vacuum/analyze in 7+ days with 250,000+ pending work
+- Fail: No vacuum/analyze in 25+ days with 500,000+ pending work
 
 Tables that go too long without maintenance may have:
 - Outdated statistics leading to poor query plans
 - Accumulated dead tuples causing bloat
 - Increased disk usage from unreclaimed space
 
-### analyze-needed
+## Size Column
 
-Identifies tables with many modifications since the last ANALYZE, indicating stale statistics.
+Table size is a **lock-free estimate** derived from `pg_class`: heap `relpages` + the TOAST relation's `relpages` + the sum of `relpages` over the table's indexes, times `block_size`.
 
-**Severity:**
-- Warning: 100,000+ modifications since last analyze
-- Fail: 500,000+ modifications since last analyze
-
-Stale statistics can cause:
-- Poor query plans (wrong join orders, missing index usage)
-- Inaccurate row estimates leading to memory issues
-- Suboptimal parallel query decisions
-
-This check differs from `statistics-freshness` which validates **database-level** stats age. This subcheck identifies **per-table** stats staleness based on actual modification activity.
+It is deliberately not `pg_total_relation_size()`, which takes an `AccessShareLock`. A new `AccessShareLock` request queues behind a *waiting* `AccessExclusiveLock`, so with a 2-second `statement_timeout` this check would SKIP during a DDL pile-up — and it runs for every table, not a top-N. The trade-off: `relpages` is only refreshed by `VACUUM`/`ANALYZE`, so the estimate is stale by definition and `0` on a never-vacuumed table.
 
 ## Pending Work Column
 
-The "Pending Work" column shown in some subchecks combines:
-- `n_dead_tup`: Dead tuples from updates/deletes
-- `n_ins_since_vacuum`: Inserted rows since last vacuum (PostgreSQL 14+)
-
-This gives a fuller picture of how much work vacuum needs to do on each table.
+The "Pending Work" column is the larger of:
+- `n_dead_tup` + `n_ins_since_vacuum`: vacuum work (inserts count too, PostgreSQL 14+)
+- `n_mod_since_analyze`: analyze work
 
 ## How to Fix
 
@@ -166,38 +152,7 @@ ORDER BY age(backend_xid) DESC;
 
 For tables that are rarely updated, this may be expected behavior.
 
-### For `analyze-needed`
-
-Tables with many modifications since the last ANALYZE have stale statistics, which can cause poor query plans, inaccurate row estimates, and suboptimal parallel query decisions.
-
-**Immediate actions:**
-
-1. Run ANALYZE on affected tables:
-```sql
-ANALYZE schema.table_name;
-```
-
-2. Check if autoanalyze is keeping up:
-```sql
-SELECT schemaname, relname, n_mod_since_analyze, last_autoanalyze, autoanalyze_count
-FROM pg_stat_user_tables
-WHERE n_mod_since_analyze > 100000
-ORDER BY n_mod_since_analyze DESC;
-```
-
-3. Consider lowering analyze thresholds for busy tables:
-```sql
-ALTER TABLE schema.busy_table SET (
-  autovacuum_analyze_scale_factor = 0.02,  -- 2% instead of 10%
-  autovacuum_analyze_threshold = 1000
-);
-```
-
-**PostgreSQL's default autoanalyze triggers when:**
-```
-modified_rows > autovacuum_analyze_threshold + (autovacuum_analyze_scale_factor * table_rows)
-Default: modified > 50 + (0.1 * rows) = 10% of table + 50 rows
-```
+When the analyze arm is the one tripping, run `ANALYZE schema.table_name` (or lower `autovacuum_analyze_scale_factor` / `autovacuum_analyze_threshold` for busy tables) to refresh statistics.
 
 ## Prevention
 

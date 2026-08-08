@@ -6,17 +6,153 @@ Monitors PostgreSQL temporary file creation which indicates queries spilling to 
 
 ## What It Checks
 
-### Temp File Creation Rate (`temp-file-rate`)
-Monitors the rate of temporary file creation:
-- **FAIL**: ≥20 files/hour (indicates serious regression or multiple problematic queries)
-- **WARN**: ≥5 files/hour (indicates new inefficient queries or query plan changes)
+### Temp File Rate (`temp-rate`)
+
+One finding carrying two numbers, the files created and the bytes written. Each is
+graded against its own thresholds and the finding reports the worse of the two.
+
+Files created:
+- **FAIL**: ≥20 files/hour (serious regression or multiple problematic queries)
+- **WARN**: ≥5 files/hour (new inefficient queries or query plan changes)
 - **Baseline**: Well-tuned production databases typically see <1 file/hour
 
-### Temp Data Volume Rate (`temp-volume-rate`)
-Monitors the volume of temp data written:
+Bytes written:
 - **FAIL**: ≥5 GB/hour (major regression or multiple large queries spilling to disk)
 - **WARN**: ≥1 GB/hour (increased large sorts/hashes from new features or query changes)
 - **Baseline**: Well-tuned production databases typically see 100-200MB/hour
+
+`temp-file-sources` below carries the same grade when it can name the statements
+responsible. When it cannot, the rate keeps it: a spill nothing accounts for is more
+often the worst case than a benign one.
+
+### The Measurement Window
+
+Both numbers are per-hour rates, so they need a period to divide by. That period
+runs from `pg_stat_database.stats_reset` — but most databases have never had
+`pg_stat_reset()` called, leaving it NULL.
+
+In that case the window is anchored to `pg_postmaster_start_time()` instead. A clean
+restart preserves the counters on PostgreSQL 15+, and everything that *does* zero
+them (crash, unclean shutdown, a rebuilt replica) happens at a server start. So the
+real window is **at least** the uptime, and the rates computed from it are **upper
+bounds**:
+
+- A rate below the threshold is conclusive — the true rate is lower still.
+- A rate above it might just be a long history divided by a short uptime, so the
+  finding is capped at WARN and never escalates to FAIL.
+
+The check reports SKIP only when the window is under an hour, where the denominator
+is small enough that a single query's temp file would dominate the rate.
+
+### Top Spilling Statements (`temp-file-sources`)
+
+When the rate finding fires, the check lists the top statements by temp data
+written, from `pg_stat_statements`. It is skipped on a healthy database: reading that
+view materialises the entire query-text corpus into a `work_mem` tuplestore, which can
+itself spill.
+
+**The table does not add up to the rate, by design.** `pg_stat_database.temp_bytes`
+measures the *disk footprint* of each temp file, its size when deleted.
+`pg_stat_statements.temp_blks_written` measures *write I/O*, and a multi-pass external
+sort rewrites the same file once per merge pass. Measured on PostgreSQL 17, one
+identical 71 MB sort reports 71 MB, 213 MB or 289 MB of writes depending on
+`work_mem`; hash joins and materialised CTEs reconcile 1:1. Rank by the table, never
+sum it.
+
+The finding is omitted when nothing can be attributed, since the rate finding has
+already reported the problem. `pg_stat_statements` keeps its own counters with their
+own reset, so `pg_stat_statements_reset()` empties this table and leaves the rate
+untouched. An absent table never means no temp file was written.
+
+Three things are missing from it:
+
+- **Cancelled and failed statements.** `pg_stat_statements` records at `ExecutorEnd`,
+  which does not run on abort, but the temp file is still counted by
+  `pg_stat_database`. If you use `statement_timeout`, the worst offender may not be
+  listed. `log_temp_files` is the only source that catches those.
+- **Logical decoding spill** (Debezium and other CDC). Not counted by this check at
+  all. See `pg_stat_replication_slots.spill_bytes`.
+- **A last-execution time.** `pg_stat_statements` has no last-seen column in any
+  version through PostgreSQL 18. "Tracked Since" is when the *entry was created*, not
+  when the statement last ran, and it is empty before PostgreSQL 17.
+
+### Investigating
+
+**If the table is empty**, the offenders exist but `pg_stat_statements` cannot see
+them, and the rate finding names the reasons it found. This is the query behind that,
+if you want the full picture:
+
+```sql
+SELECT
+  (SELECT count(*) FROM pg_stat_statements
+     WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+       AND temp_blks_written > 0)                                           AS with_temp,
+  (SELECT setting FROM pg_settings WHERE name = 'pg_stat_statements.track') AS track,
+  (SELECT setting FROM pg_settings
+     WHERE name = 'pg_stat_statements.track_utility')                       AS track_utility,
+  (SELECT setting FROM pg_settings WHERE name = 'pg_stat_statements.max')   AS max_entries,
+  (SELECT dealloc FROM pg_stat_statements_info)                             AS evictions,
+  (SELECT stats_reset FROM pg_stat_statements_info)                         AS pgss_reset,
+  (SELECT stats_reset FROM pg_stat_database
+     WHERE datname = current_database())                                    AS db_stats_reset,
+  (SELECT setting FROM pg_settings WHERE name = 'statement_timeout')        AS statement_timeout,
+  (SELECT setting FROM pg_settings WHERE name = 'log_temp_files')           AS log_temp_files;
+```
+
+| Reading | Meaning |
+|---|---|
+| `statement_timeout` set | A killed query never reaches `ExecutorEnd`, so it is never recorded, while its temp file still counts. Usually the cause, and the offender is an expensive statement by construction |
+| `evictions` large | Entries are discarded faster than they accumulate. Each event drops about 5% of `max`, so a large count means the working set of distinct statements far exceeds capacity. Anything infrequent disappears before it can be read, and **every** `pg_stat_statements`-based check is then analysing a truncated sample |
+| `track_utility = off` | `CREATE INDEX`, `CLUSTER` and `VACUUM FULL` write sort files and are not recorded |
+| `pgss_reset` ≫ `db_stats_reset` | Query stats were reset; the rate kept its history while attribution started over |
+| `track = none` | Nothing is being recorded at all |
+
+`log_temp_files = 0` logs every temp file with its size and the statement that wrote
+it. It is the only source that sees all of them, and the fallback whenever the table
+cannot explain the rate.
+
+**If the top entry is a monitoring query**, it is not a false positive. Reading
+`pg_stat_statements` materialises its entire query-text corpus into a `work_mem`
+tuplestore before any filter applies, so an agent polling it frequently can become the
+largest temp producer on the instance. Check the poll interval and `work_mem` for that
+role before looking anywhere else. pgdoctor excludes its own statements from the
+table. Other tools' are left in deliberately, since they spill like anything else.
+
+**A high volume rate with a low file rate** means few, very large files: sorts, hash
+joins or index builds exceeding `work_mem` by a wide margin, rather than routine
+overflow. Divide one by the other for the average file size.
+
+### Verifying a Fix
+
+Because the counters are cumulative and nothing decays, a statement you fixed today
+still appears next week with the same totals. To check whether a fix landed, reset
+that one statement's entry:
+
+```sql
+SELECT pg_stat_statements_reset(
+    0,
+    (SELECT oid FROM pg_database WHERE datname = current_database()),
+    <queryid>);   -- from the table above
+```
+
+A targeted reset **deletes** the entry (measured at ~0.4 ms; it touches only the
+`pg_stat_statements` hash table). Re-run this check after a full traffic cycle:
+
+- entry still absent: the statement has not run
+- entry back with no temp writes: it ran and no longer spills
+- entry back at the top: the fix did not land
+
+This needs EXECUTE on `pg_stat_statements_reset`, which is **superuser-only by default
+and is not granted to `pg_monitor`**, so a read-only monitoring role cannot do it.
+
+**Do not run `pg_stat_reset()` on a production primary** to clear the headline rate.
+It is the only thing that clears `temp_files`/`temp_bytes`, but it also zeroes
+`n_dead_tup` and `n_mod_since_analyze` for every table, which are the counters
+autovacuum schedules on, so every table's next autovacuum is deferred until the churn
+re-accumulates. Compare two runs of this check over a known interval instead.
+
+The two clocks are independent: `pg_stat_statements_reset()` clears the table and
+leaves the rate untouched; `pg_stat_reset()` clears the rate and leaves the table.
 
 ## Why This Matters
 
@@ -32,9 +168,11 @@ Temp files cause:
 
 ## How to Fix
 
-### For `temp-file-rate`
+### For `temp-rate`
 
-High temp file creation rate (>5 files/hour) indicates queries spilling to disk. Fix by increasing work_mem or optimizing queries:
+The finding reports both rates, so start with whichever crossed its threshold.
+
+**A high file creation rate** (>5 files/hour) indicates queries spilling to disk. Fix by increasing work_mem or optimizing queries:
 
 **Option 1: Increase work_mem globally (use with caution)**
 ```sql
@@ -60,8 +198,10 @@ ALTER SYSTEM SET log_temp_files = 10240;  -- Log temp files >10MB
 SELECT pg_reload_conf();
 
 -- Query pg_stat_statements to find offenders
+-- temp_blks_written is write I/O, not disk footprint: a multi-pass external sort
+-- rewrites the same file, so this can exceed the bytes the file ever occupied.
 SELECT query, calls, temp_blks_written,
-       pg_size_pretty(temp_blks_written * 8192) AS temp_size
+       pg_size_pretty(temp_blks_written * current_setting('block_size')::bigint) AS temp_written
 FROM pg_stat_statements
 WHERE temp_blks_written > 0
 ORDER BY temp_blks_written DESC
@@ -70,11 +210,9 @@ LIMIT 20;
 -- Then optimize queries: add indexes, rewrite joins, limit result sets
 ```
 
-### For `temp-volume-rate`
+**A high data volume** (>1GB/hour) indicates large sorts/hashes spilling to disk:
 
-High temp data volume (>1GB/hour) indicates large sorts/hashes spilling to disk:
-
-**Option 1: Increase work_mem (same as temp-file-rate)**
+**Option 1: Increase work_mem (same as above)**
 
 **Option 2: Optimize large queries**
 ```sql
@@ -134,8 +272,10 @@ SELECT pg_reload_conf();
 
 ### Query pg_stat_statements
 ```sql
+-- temp_blks_written is write I/O, not disk footprint: a multi-pass external sort
+-- rewrites the same file, so this can exceed the bytes the file ever occupied.
 SELECT query, calls, temp_blks_written,
-       pg_size_pretty(temp_blks_written * 8192) AS temp_size
+       pg_size_pretty(temp_blks_written * current_setting('block_size')::bigint) AS temp_written
 FROM pg_stat_statements
 WHERE temp_blks_written > 0
 ORDER BY temp_blks_written DESC

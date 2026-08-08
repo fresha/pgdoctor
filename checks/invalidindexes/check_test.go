@@ -8,6 +8,7 @@ import (
 	"github.com/fresha/pgdoctor/check"
 	"github.com/fresha/pgdoctor/checks/invalidindexes"
 	"github.com/fresha/pgdoctor/db"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/stretchr/testify/require"
 )
 
@@ -33,11 +34,20 @@ func newMockQueryerWithError(err error) *mockInvalidIndexesQueryer {
 }
 
 func brokenIndex(schema, table, index string) db.BrokenIndexesRow {
-	return db.BrokenIndexesRow{SchemaName: schema, TableName: table, IndexName: index, IsLeftover: false}
+	return indexRow(schema, table, index, false)
 }
 
 func leftoverIndex(schema, table, index string) db.BrokenIndexesRow {
-	return db.BrokenIndexesRow{SchemaName: schema, TableName: table, IndexName: index, IsLeftover: true}
+	return indexRow(schema, table, index, true)
+}
+
+func indexRow(schema, table, index string, leftover bool) db.BrokenIndexesRow {
+	return db.BrokenIndexesRow{
+		SchemaName: pgtype.Text{String: schema, Valid: true},
+		TableName:  pgtype.Text{String: table, Valid: true},
+		IndexName:  pgtype.Text{String: index, Valid: true},
+		IsLeftover: pgtype.Bool{Bool: leftover, Valid: true},
+	}
 }
 
 // onlyFinding returns the single finding the check always emits.
@@ -58,7 +68,7 @@ func Test_InvalidIndexes_Severity(t *testing.T) {
 		{
 			Name:     "no invalid indexes - OK",
 			Indexes:  []db.BrokenIndexesRow{},
-			Severity: check.SeverityOK,
+			Severity: check.SeverityPass,
 		},
 		{
 			Name:     "broken index - WARN",
@@ -107,7 +117,7 @@ func Test_InvalidIndexes_OK_NoDetailsNoTable(t *testing.T) {
 	require.NoError(t, err)
 
 	finding := onlyFinding(t, report)
-	require.Equal(t, check.SeverityOK, finding.Severity)
+	require.Equal(t, check.SeverityPass, finding.Severity)
 	require.Empty(t, finding.Details, "OK finding carries no details")
 	require.Nil(t, finding.Table, "OK finding carries no table")
 }

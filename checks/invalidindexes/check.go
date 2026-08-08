@@ -57,7 +57,7 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 		report.AddFinding(check.Finding{
 			ID:       report.CheckID,
 			Name:     report.Name,
-			Severity: check.SeverityOK,
+			Severity: check.SeverityPass,
 		})
 		return report, nil
 	}
@@ -70,14 +70,14 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 	tableRows := make([]check.TableRow, 0, len(rows))
 	for _, row := range rows {
 		kind := "broken"
-		if row.IsLeftover {
+		if row.IsLeftover.Bool {
 			kind = "leftover"
 			leftover++
 		} else {
 			broken++
 		}
 		tableRows = append(tableRows, check.TableRow{
-			Cells:    []string{row.SchemaName, row.TableName, row.IndexName, kind},
+			Cells:    []string{row.SchemaName.String, row.TableName.String, row.IndexName.String, kind},
 			Severity: check.SeverityWarn,
 		})
 	}

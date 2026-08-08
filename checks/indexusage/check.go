@@ -5,10 +5,10 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
-	"strings"
 
 	"github.com/fresha/pgdoctor/check"
 	"github.com/fresha/pgdoctor/db"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 //go:embed query.sql
@@ -18,13 +18,11 @@ var querySQL string
 var readme string
 
 const (
-	unusedSizeThresholdMB  = 10
-	lowUsageScanThreshold  = 1000
+	unusedSizeFloorBytes   = 500 * check.MiB
+	lowUsageSizeFloorBytes = 500 * check.MiB
 	lowUsageWriteThreshold = 10000
-	cacheLowThreshold      = 90.0
-	cacheWarnThreshold     = 95.0
-	cacheMinSizeMB         = 10
-	cacheFailSizeMB        = 100
+	lowUsageMinWindowDays  = 30
+	secondsPerDay          = 24 * 60 * 60
 )
 
 type IndexUsageQueries interface {
@@ -68,158 +66,137 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 		report.AddFinding(check.Finding{
 			ID:       report.CheckID,
 			Name:     report.Name,
-			Severity: check.SeverityOK,
+			Severity: check.SeverityPass,
 		})
 		return report, nil
 	}
 
-	checkUnusedIndexes(rows, report)
-	checkLowUsageIndexes(rows, report)
-	checkIndexCacheRatio(rows, report)
+	// Every row carries the same database-wide values, so the first one answers for the set.
+	checkUnusedIndexes(rows, rows[0].StatsReset, report)
+	checkLowUsageIndexes(rows, rows[0].StatsAgeSeconds, report)
 
 	return report, nil
 }
 
-func checkUnusedIndexes(rows []db.IndexUsageStatsRow, report *check.Report) {
-	var unusedIndexes []string
-	unusedCount := 0
-
+func checkUnusedIndexes(rows []db.IndexUsageStatsRow, statsReset pgtype.Timestamptz, report *check.Report) {
+	var unused []db.IndexUsageStatsRow
 	for _, row := range rows {
 		if row.IsPrimary || row.IsUnique {
 			continue
 		}
-
-		sizeBytes := row.IndexSizeBytes
-		sizeMB := float64(sizeBytes.Int64) / (1024 * 1024)
-
-		if row.IdxScan.Int64 == 0 && sizeMB > unusedSizeThresholdMB {
-			unusedCount++
-			if len(unusedIndexes) < 10 {
-				unusedIndexes = append(unusedIndexes, fmt.Sprintf("%s.%s (%.1f MB)", row.TableName.String, row.IndexName.String, sizeMB))
-			}
+		if row.IdxScan.Int64 == 0 && row.IndexSizeBytes.Int64 >= unusedSizeFloorBytes {
+			unused = append(unused, row)
 		}
 	}
 
-	if unusedCount == 0 {
+	if len(unused) == 0 {
 		report.AddFinding(check.Finding{
 			ID:       "unused-indexes",
 			Name:     "Unused Indexes",
-			Severity: check.SeverityOK,
+			Severity: check.SeverityPass,
 		})
 		return
 	}
 
-	details := fmt.Sprintf("Found %d unused indexes (0 scans, size > %d MB):\n%s",
-		unusedCount,
-		unusedSizeThresholdMB,
-		strings.Join(unusedIndexes, "\n"),
-	)
-	if unusedCount > len(unusedIndexes) {
-		details += fmt.Sprintf("\n... and %d more", unusedCount-len(unusedIndexes))
+	tableRows := make([]check.TableRow, 0, len(unused))
+	for _, row := range unused {
+		tableRows = append(tableRows, check.TableRow{
+			Cells: []string{
+				row.TableName.String,
+				row.IndexName.String,
+				check.FormatBytes(row.IndexSizeBytes.Int64),
+			},
+			Severity: check.SeverityWarn,
+		})
+	}
+
+	since := ""
+	if statsReset.Valid {
+		since = fmt.Sprintf(" since %s", statsReset.Time.Format("2006-01-02"))
 	}
 
 	report.AddFinding(check.Finding{
 		ID:       "unused-indexes",
 		Name:     "Unused Indexes",
 		Severity: check.SeverityWarn,
-		Details:  details,
+		Details:  fmt.Sprintf("Found %d unused indexes (0 scans%s, >500MB)", len(unused), since),
+		Table: &check.Table{
+			Headers: []string{"Table", "Index", "Size"},
+			Rows:    tableRows,
+		},
 	})
 }
 
-func checkLowUsageIndexes(rows []db.IndexUsageStatsRow, report *check.Report) {
-	var lowUsageIndexes []string
-	lowUsageCount := 0
+func checkLowUsageIndexes(rows []db.IndexUsageStatsRow, statsAgeSeconds pgtype.Int8, report *check.Report) {
+	windowKnown := statsAgeSeconds.Valid
+	windowDays := 0
+	if windowKnown {
+		windowDays = int(statsAgeSeconds.Int64 / secondsPerDay)
+	}
 
+	// A NULL stats_reset means counters run since creation: an old window that
+	// trivially clears the age gate and the read-rate gate.
+	if windowKnown && windowDays < lowUsageMinWindowDays {
+		reportLowUsage(nil, report)
+		return
+	}
+
+	var lowUsage []db.IndexUsageStatsRow
 	for _, row := range rows {
 		if row.IsPrimary || row.IsUnique {
 			continue
 		}
-
-		if row.IdxScan.Int64 > 0 && row.IdxScan.Int64 < lowUsageScanThreshold && row.TableWrites.Int64 > lowUsageWriteThreshold {
-			lowUsageCount++
-			if len(lowUsageIndexes) < 10 {
-				lowUsageIndexes = append(lowUsageIndexes, fmt.Sprintf("%s.%s (scans: %d, writes: %d)",
-					row.TableName.String, row.IndexName.String, row.IdxScan.Int64, row.TableWrites.Int64))
-			}
+		// Zero-scan indexes belong to unused-indexes; low-usage covers 1..low-rate.
+		if row.IdxScan.Int64 == 0 {
+			continue
 		}
+		if row.TableWrites.Int64 < lowUsageWriteThreshold {
+			continue
+		}
+		if row.IndexSizeBytes.Int64 < lowUsageSizeFloorBytes {
+			continue
+		}
+		if windowKnown && row.IdxScan.Int64*7 >= int64(windowDays) {
+			continue
+		}
+		lowUsage = append(lowUsage, row)
 	}
 
-	if lowUsageCount == 0 {
+	reportLowUsage(lowUsage, report)
+}
+
+func reportLowUsage(lowUsage []db.IndexUsageStatsRow, report *check.Report) {
+	if len(lowUsage) == 0 {
 		report.AddFinding(check.Finding{
 			ID:       "low-usage-indexes",
 			Name:     "Low Usage Indexes",
-			Severity: check.SeverityOK,
+			Severity: check.SeverityPass,
 		})
 		return
 	}
 
-	details := fmt.Sprintf("Found %d indexes with low read usage but high write cost:\n%s",
-		lowUsageCount,
-		strings.Join(lowUsageIndexes, "\n"),
-	)
-	if lowUsageCount > len(lowUsageIndexes) {
-		details += fmt.Sprintf("\n... and %d more", lowUsageCount-len(lowUsageIndexes))
+	tableRows := make([]check.TableRow, 0, len(lowUsage))
+	for _, row := range lowUsage {
+		tableRows = append(tableRows, check.TableRow{
+			Cells: []string{
+				row.TableName.String,
+				row.IndexName.String,
+				check.FormatBytes(row.IndexSizeBytes.Int64),
+				check.FormatNumber(row.IdxScan.Int64),
+				check.FormatNumber(row.TableWrites.Int64),
+			},
+			Severity: check.SeverityInfo,
+		})
 	}
 
 	report.AddFinding(check.Finding{
 		ID:       "low-usage-indexes",
 		Name:     "Low Usage Indexes",
-		Severity: check.SeverityWarn,
-		Details:  details,
-	})
-}
-
-func checkIndexCacheRatio(rows []db.IndexUsageStatsRow, report *check.Report) {
-	var lowCacheIndexes []string
-	failCount := 0
-	warnCount := 0
-
-	for _, row := range rows {
-		if !row.CacheHitRatio.Valid {
-			continue
-		}
-
-		cacheRatio, _ := row.CacheHitRatio.Float64Value()
-		sizeBytes := row.IndexSizeBytes
-		sizeMB := float64(sizeBytes.Int64) / (1024 * 1024)
-
-		if cacheRatio.Float64 < cacheLowThreshold && sizeMB > cacheFailSizeMB {
-			failCount++
-			if len(lowCacheIndexes) < 10 {
-				lowCacheIndexes = append(lowCacheIndexes, fmt.Sprintf("%s.%s (%.1f%%, %.1f MB)",
-					row.TableName.String, row.IndexName.String, cacheRatio.Float64, sizeMB))
-			}
-		} else if cacheRatio.Float64 < cacheWarnThreshold && sizeMB > cacheMinSizeMB {
-			warnCount++
-			if len(lowCacheIndexes) < 10 {
-				lowCacheIndexes = append(lowCacheIndexes, fmt.Sprintf("%s.%s (%.1f%%, %.1f MB)",
-					row.TableName.String, row.IndexName.String, cacheRatio.Float64, sizeMB))
-			}
-		}
-	}
-
-	totalIssues := failCount + warnCount
-	if totalIssues == 0 {
-		report.AddFinding(check.Finding{
-			ID:       "index-cache-ratio",
-			Name:     "Index Cache Efficiency",
-			Severity: check.SeverityOK,
-		})
-		return
-	}
-
-	details := fmt.Sprintf("Found %d indexes with low cache hit ratios:\n%s",
-		totalIssues,
-		strings.Join(lowCacheIndexes, "\n"),
-	)
-	if totalIssues > len(lowCacheIndexes) {
-		details += fmt.Sprintf("\n... and %d more", totalIssues-len(lowCacheIndexes))
-	}
-
-	report.AddFinding(check.Finding{
-		ID:       "index-cache-ratio",
-		Name:     "Index Cache Efficiency",
-		Severity: check.SeverityWarn,
-		Details:  details,
+		Severity: check.SeverityInfo,
+		Details:  fmt.Sprintf("Found %d indexes with sustained low read rates (>500MB, >=10k writes, <1 scan/week)", len(lowUsage)),
+		Table: &check.Table{
+			Headers: []string{"Table", "Index", "Size", "Scans", "Writes"},
+			Rows:    tableRows,
+		},
 	})
 }

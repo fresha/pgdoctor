@@ -8,6 +8,7 @@ import (
 	"github.com/fresha/pgdoctor/check"
 	"github.com/fresha/pgdoctor/checks/connectionhealth"
 	"github.com/fresha/pgdoctor/db"
+	"github.com/fresha/pgdoctor/internal/checktest"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/stretchr/testify/require"
 )
@@ -139,12 +140,12 @@ func Test_ConnectionHealth_AllOK(t *testing.T) {
 
 	// All 6 subchecks should report OK (overview + 5 checks).
 	require.Len(t, report.Results, 6)
-	require.True(t, hasResult(report.Results, "connection-overview", check.SeverityOK))
-	require.True(t, hasResult(report.Results, "connection-saturation", check.SeverityOK))
-	require.True(t, hasResult(report.Results, "pool-pressure", check.SeverityOK))
-	require.True(t, hasResult(report.Results, "idle-ratio", check.SeverityOK))
-	require.True(t, hasResult(report.Results, "idle-in-transaction", check.SeverityOK))
-	require.True(t, hasResult(report.Results, "long-idle", check.SeverityOK))
+	require.True(t, hasResult(report.Results, "connection-overview", check.SeverityPass))
+	require.True(t, hasResult(report.Results, "connection-saturation", check.SeverityPass))
+	require.True(t, hasResult(report.Results, "pool-pressure", check.SeverityPass))
+	require.True(t, hasResult(report.Results, "idle-ratio", check.SeverityPass))
+	require.True(t, hasResult(report.Results, "idle-in-transaction", check.SeverityPass))
+	require.True(t, hasResult(report.Results, "long-idle", check.SeverityPass))
 }
 
 func Test_ConnectionHealth_Saturation(t *testing.T) {
@@ -162,7 +163,7 @@ func Test_ConnectionHealth_Saturation(t *testing.T) {
 			maxConns:         100,
 			reserved:         3,
 			total:            50, // 51.5% of 97 available
-			expectedSeverity: check.SeverityOK,
+			expectedSeverity: check.SeverityPass,
 		},
 		{
 			name:             "at warning threshold",
@@ -224,21 +225,21 @@ func Test_ConnectionHealth_PoolPressure(t *testing.T) {
 			total:            8,
 			active:           7,
 			idle:             1,
-			expectedSeverity: check.SeverityOK, // Skipped, too few connections
+			expectedSeverity: check.SeverityPass, // Skipped, too few connections
 		},
 		{
 			name:             "healthy pool with idle capacity",
 			total:            50,
 			active:           30, // 60% active
 			idle:             15,
-			expectedSeverity: check.SeverityOK,
+			expectedSeverity: check.SeverityPass,
 		},
 		{
 			name:             "high active but enough idle",
 			total:            50,
 			active:           46, // 92% active
 			idle:             4,  // >= 3 idle, so OK
-			expectedSeverity: check.SeverityOK,
+			expectedSeverity: check.SeverityPass,
 		},
 		{
 			name:             "warning - high active, low idle",
@@ -299,19 +300,19 @@ func Test_ConnectionHealth_IdleRatio(t *testing.T) {
 			name:             "too few connections to check",
 			total:            15,
 			idle:             14, // 93% but under 20 total
-			expectedSeverity: check.SeverityOK,
+			expectedSeverity: check.SeverityPass,
 		},
 		{
 			name:             "reported sample no longer fails",
 			total:            29,
 			idle:             22, // 75.9% idle - advisory, stays OK
-			expectedSeverity: check.SeverityOK,
+			expectedSeverity: check.SeverityPass,
 		},
 		{
 			name:             "healthy idle ratio",
 			total:            100,
 			idle:             40, // 40% (well below 90% warn threshold)
-			expectedSeverity: check.SeverityOK,
+			expectedSeverity: check.SeverityPass,
 		},
 		{
 			name:             "warning idle ratio",
@@ -362,7 +363,7 @@ func Test_ConnectionHealth_IdleInTransaction(t *testing.T) {
 		{
 			name:             "no idle in transaction",
 			idleTxns:         nil,
-			expectedSeverity: check.SeverityOK,
+			expectedSeverity: check.SeverityPass,
 		},
 		{
 			name: "below warn threshold (default timeout)",
@@ -378,7 +379,7 @@ func Test_ConnectionHealth_IdleInTransaction(t *testing.T) {
 					TimeoutMs:                  int64Val(0), // 0 = use default 5min
 				},
 			},
-			expectedSeverity: check.SeverityOK,
+			expectedSeverity: check.SeverityPass,
 		},
 		{
 			name: "warning level (default timeout)",
@@ -479,28 +480,45 @@ func Test_ConnectionHealth_LongIdle(t *testing.T) {
 
 	tests := []struct {
 		name             string
+		maxConns         int32
 		longIdle         []db.LongIdleConnectionsRow
 		expectedSeverity check.Severity
 	}{
 		{
 			name:             "no long idle connections",
+			maxConns:         100,
 			longIdle:         nil,
-			expectedSeverity: check.SeverityOK,
+			expectedSeverity: check.SeverityPass,
 		},
 		{
-			name:             "few long idle connections",
-			longIdle:         makeLongIdleRows(5),
-			expectedSeverity: check.SeverityOK,
+			name:             "at warn threshold (100) stays OK",
+			maxConns:         100,
+			longIdle:         makeLongIdleRows(100),
+			expectedSeverity: check.SeverityPass,
 		},
 		{
-			name:             "many long idle connections",
-			longIdle:         makeLongIdleRows(15),
+			name:             "above 100 warns",
+			maxConns:         100,
+			longIdle:         makeLongIdleRows(101),
 			expectedSeverity: check.SeverityWarn,
 		},
 		{
-			name:             "excessive long idle connections",
-			longIdle:         makeLongIdleRows(55),
+			name:             "at fail threshold (500) still warns",
+			maxConns:         100,
+			longIdle:         makeLongIdleRows(500),
+			expectedSeverity: check.SeverityWarn,
+		},
+		{
+			name:             "above 500 fails",
+			maxConns:         100,
+			longIdle:         makeLongIdleRows(501),
 			expectedSeverity: check.SeverityFail,
+		},
+		{
+			name:             "pooled warm floor stays OK",
+			maxConns:         400,
+			longIdle:         makeLongIdleRows(62), // shedul's pgbouncer min_pool_size floor
+			expectedSeverity: check.SeverityPass,
 		},
 	}
 
@@ -508,8 +526,11 @@ func Test_ConnectionHealth_LongIdle(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
+			stats := healthyStats()
+			stats.MaxConnections = int32Val(tt.maxConns)
+
 			mock := &mockQueries{
-				stats:    healthyStats(),
+				stats:    stats,
 				longIdle: tt.longIdle,
 			}
 
@@ -518,6 +539,7 @@ func Test_ConnectionHealth_LongIdle(t *testing.T) {
 
 			require.NoError(t, err)
 			require.True(t, hasResult(report.Results, "long-idle", tt.expectedSeverity))
+			checktest.AssertSeverityInvariant(t, report)
 		})
 	}
 }
@@ -662,7 +684,7 @@ func Test_ConnectionHealth_ReportSeverity(t *testing.T) {
 					stats: healthyStats(),
 				}
 			},
-			expectedSeverity: check.SeverityOK,
+			expectedSeverity: check.SeverityPass,
 		},
 		{
 			name: "one warning subcheck",

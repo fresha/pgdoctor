@@ -4,7 +4,7 @@
       "id": "cache-efficiency",
       "name": "Cache Efficiency",
       "category": "performance",
-      "description": "Analyzes database-wide buffer cache hit ratio"
+      "description": "Analyzes database-wide, per-index, and per-table buffer cache hit ratios"
     },
     {
       "id": "connection-efficiency",
@@ -23,6 +23,12 @@
       "name": "Duplicate Indexes",
       "category": "indexes",
       "description": "Identifies exact and prefix duplicate indexes wasting disk space"
+    },
+    {
+      "id": "extension-versions",
+      "name": "PostgreSQL Extension Versions",
+      "category": "configs",
+      "description": "Inventories installed extensions and flags versions no longer supported upstream"
     },
     {
       "id": "freeze-age",
@@ -71,6 +77,12 @@
       "name": "Primary Key Type Validation",
       "category": "schema",
       "description": "Validates primary keys use bigint or UUID for sufficient growth capacity"
+    },
+    {
+      "id": "query-stats-capacity",
+      "name": "Query Stats Capacity",
+      "category": "configs",
+      "description": "Reports pg_stat_statements entry usage and how fast entries are evicted"
     },
     {
       "id": "replication-lag",

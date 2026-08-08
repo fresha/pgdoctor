@@ -7,6 +7,7 @@ import (
 	"github.com/fresha/pgdoctor/check"
 	"github.com/fresha/pgdoctor/checks/sessionsettings"
 	"github.com/fresha/pgdoctor/db"
+	"github.com/fresha/pgdoctor/internal/checktest"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/stretchr/testify/require"
 )
@@ -120,7 +121,7 @@ func Test_SessionSettings(t *testing.T) {
 			Name: "with optimal values, check is OK",
 			Rows: mapToSessionSettingsRows(optimalSessionSettings()),
 			Expect: []ExpectedResultCheck{
-				{ID: "session-settings", Sev: check.SeverityOK},
+				{ID: "session-settings", Sev: check.SeverityPass},
 			},
 		},
 		// Statement timeout tests
@@ -128,14 +129,14 @@ func Test_SessionSettings(t *testing.T) {
 			Name: "statement_timeout disabled for app_ro",
 			Rows: overrideOptimalSessionSettings("app_ro", "statement_timeout", "0"),
 			Expect: []ExpectedResultCheck{
-				{ID: "session-settings", Sev: check.SeverityFail},
+				{ID: "session-settings", Sev: check.SeverityWarn},
 			},
 		},
 		{
 			Name: "statement_timeout too high for app_ro",
 			Rows: overrideOptimalSessionSettings("app_ro", "statement_timeout", "15000"),
 			Expect: []ExpectedResultCheck{
-				{ID: "session-settings", Sev: check.SeverityFail},
+				{ID: "session-settings", Sev: check.SeverityWarn},
 			},
 		},
 		{
@@ -154,14 +155,14 @@ func Test_SessionSettings(t *testing.T) {
 				"app_ro", "statement_timeout", "ms",
 			),
 			Expect: []ExpectedResultCheck{
-				{ID: "session-settings", Sev: check.SeverityOK},
+				{ID: "session-settings", Sev: check.SeverityPass},
 			},
 		},
 		{
 			Name: "statement_timeout disabled for both roles",
 			Rows: overrideBothRoles("statement_timeout", "0"),
 			Expect: []ExpectedResultCheck{
-				{ID: "session-settings", Sev: check.SeverityFail},
+				{ID: "session-settings", Sev: check.SeverityWarn},
 			},
 		},
 		// Idle timeout tests
@@ -186,7 +187,7 @@ func Test_SessionSettings(t *testing.T) {
 			Name: "transaction_timeout missing for app_ro (PG < 17) is skipped",
 			Rows: removeFromSessionSettings("app_ro", "transaction_timeout"),
 			Expect: []ExpectedResultCheck{
-				{ID: "session-settings", Sev: check.SeverityOK},
+				{ID: "session-settings", Sev: check.SeverityPass},
 			},
 		},
 		{
@@ -194,22 +195,22 @@ func Test_SessionSettings(t *testing.T) {
 			Name: "transaction_timeout absent for all roles (PG < 17) yields no finding",
 			Rows: removeFromAllRoles("transaction_timeout"),
 			Expect: []ExpectedResultCheck{
-				{ID: "session-settings", Sev: check.SeverityOK},
+				{ID: "session-settings", Sev: check.SeverityPass},
 			},
 		},
 		{
-			// PG17+ present with value 0 must still FAIL (regression guard).
+			// PG17+ present with value 0 must WARN (regression guard).
 			Name: "transaction_timeout disabled for app_ro",
 			Rows: overrideOptimalSessionSettings("app_ro", "transaction_timeout", "0"),
 			Expect: []ExpectedResultCheck{
-				{ID: "session-settings", Sev: check.SeverityFail},
+				{ID: "session-settings", Sev: check.SeverityWarn},
 			},
 		},
 		{
 			Name: "transaction_timeout too high for app_ro",
 			Rows: overrideOptimalSessionSettings("app_ro", "transaction_timeout", "15000"),
 			Expect: []ExpectedResultCheck{
-				{ID: "session-settings", Sev: check.SeverityFail},
+				{ID: "session-settings", Sev: check.SeverityWarn},
 			},
 		},
 		{
@@ -224,21 +225,21 @@ func Test_SessionSettings(t *testing.T) {
 			Name: "log_min_duration_statement disabled for app_ro",
 			Rows: overrideOptimalSessionSettings("app_ro", "log_min_duration_statement", "-1"),
 			Expect: []ExpectedResultCheck{
-				{ID: "session-settings", Sev: check.SeverityFail},
+				{ID: "session-settings", Sev: check.SeverityWarn},
 			},
 		},
 		{
 			Name: "log_min_duration_statement too low for app_ro",
 			Rows: overrideOptimalSessionSettings("app_ro", "log_min_duration_statement", "100"),
 			Expect: []ExpectedResultCheck{
-				{ID: "session-settings", Sev: check.SeverityFail},
+				{ID: "session-settings", Sev: check.SeverityWarn},
 			},
 		},
 		{
 			Name: "log_min_duration_statement too low for both roles",
 			Rows: overrideBothRoles("log_min_duration_statement", "100"),
 			Expect: []ExpectedResultCheck{
-				{ID: "session-settings", Sev: check.SeverityFail},
+				{ID: "session-settings", Sev: check.SeverityWarn},
 			},
 		},
 	}
@@ -252,6 +253,7 @@ func Test_SessionSettings(t *testing.T) {
 			checker := sessionsettings.New(queryer)
 			report, err := checker.Check(context.Background())
 			require.NoError(t, err)
+			checktest.AssertSeverityInvariant(t, report)
 
 			results := report.Results
 			require.Equal(t, 1, len(results), "Should have exactly 1 result")
@@ -261,7 +263,7 @@ func Test_SessionSettings(t *testing.T) {
 			require.Equal(t, tc.Expect[0].Sev, result.Severity, "Result severity should match")
 
 			// If not OK, should have a table
-			if result.Severity != check.SeverityOK {
+			if result.Severity != check.SeverityPass {
 				require.NotNil(t, result.Table, "Non-OK result should have a table")
 				require.Greater(t, len(result.Table.Rows), 0, "Table should have rows")
 			}
@@ -274,16 +276,16 @@ func Test_SessionSettings_MultipleIssues(t *testing.T) {
 
 	settings := map[string]map[string]string{
 		"app_ro": {
-			"statement_timeout":                   "0",     // disabled - FAIL
+			"statement_timeout":                   "0",     // disabled - WARN
 			"idle_in_transaction_session_timeout": "0",     // disabled - WARN
-			"transaction_timeout":                 "15000", // too high - FAIL
-			"log_min_duration_statement":          "-1",    // disabled - FAIL
+			"transaction_timeout":                 "15000", // too high - WARN
+			"log_min_duration_statement":          "-1",    // disabled - WARN
 		},
 		"app_rw": {
 			"statement_timeout":                   "7000",  // high - WARN
 			"idle_in_transaction_session_timeout": "60000", // OK
-			"transaction_timeout":                 "0",     // disabled - FAIL
-			"log_min_duration_statement":          "100",   // too low - FAIL
+			"transaction_timeout":                 "0",     // disabled - WARN
+			"log_min_duration_statement":          "100",   // too low - WARN
 		},
 	}
 
@@ -292,6 +294,7 @@ func Test_SessionSettings_MultipleIssues(t *testing.T) {
 	checker := sessionsettings.New(queryer)
 	report, err := checker.Check(context.Background())
 	require.NoError(t, err)
+	checktest.AssertSeverityInvariant(t, report)
 
 	results := report.Results
 	require.Equal(t, 1, len(results), "Should have exactly 1 result")
@@ -302,19 +305,11 @@ func Test_SessionSettings_MultipleIssues(t *testing.T) {
 	// Should have multiple issues detected in the table
 	require.Greater(t, len(result.Table.Rows), 5, "Should detect multiple configuration issues")
 
-	// Verify we have both FAIL and WARN severities in table rows
-	hasFail := false
-	hasWarn := false
+	// The check caps at WARN: every issue is a WARN, none escalate to FAIL.
+	require.Equal(t, check.SeverityWarn, result.Severity, "Report caps at WARN")
 	for _, row := range result.Table.Rows {
-		if row.Severity == check.SeverityFail {
-			hasFail = true
-		}
-		if row.Severity == check.SeverityWarn {
-			hasWarn = true
-		}
+		require.Equal(t, check.SeverityWarn, row.Severity, "Every issue row should be WARN")
 	}
-	require.True(t, hasFail, "Should have at least one FAIL severity in table rows")
-	require.True(t, hasWarn, "Should have at least one WARN severity in table rows")
 }
 
 func Test_SessionSettings_BothRolesCheckedEqually(t *testing.T) {
@@ -328,6 +323,7 @@ func Test_SessionSettings_BothRolesCheckedEqually(t *testing.T) {
 	checker := sessionsettings.New(queryer)
 	report, err := checker.Check(context.Background())
 	require.NoError(t, err)
+	checktest.AssertSeverityInvariant(t, report)
 
 	results := report.Results
 	require.Equal(t, 1, len(results), "Should have exactly 1 result")
@@ -404,6 +400,7 @@ func Test_SessionSettings_SpecificDetailChecks(t *testing.T) {
 			checker := sessionsettings.New(queryer)
 			report, err := checker.Check(context.Background())
 			require.NoError(t, err)
+			checktest.AssertSeverityInvariant(t, report)
 
 			results := report.Results
 			require.Equal(t, 1, len(results), "Should have exactly 1 result")
@@ -437,12 +434,13 @@ func Test_SessionSettings_EmptyRoles(t *testing.T) {
 	checker := sessionsettings.New(queryer)
 	report, err := checker.Check(context.Background())
 	require.NoError(t, err)
+	checktest.AssertSeverityInvariant(t, report)
 
 	results := report.Results
 	require.Equal(t, 1, len(results), "Should have exactly 1 result")
 
 	result := results[0]
-	require.Equal(t, check.SeverityOK, result.Severity, "Empty roles should be OK")
+	require.Equal(t, check.SeverityPass, result.Severity, "Empty roles should be OK")
 	require.Equal(t, "No application roles found", result.Details)
 }
 
@@ -469,10 +467,11 @@ func Test_SessionSettings_ArbitraryRoleNames(t *testing.T) {
 	checker := sessionsettings.New(queryer)
 	report, err := checker.Check(context.Background())
 	require.NoError(t, err)
+	checktest.AssertSeverityInvariant(t, report)
 
 	results := report.Results
 	require.Equal(t, 1, len(results), "Should have exactly 1 result")
-	require.Equal(t, check.SeverityOK, results[0].Severity, "Arbitrary role names with optimal settings should be OK")
+	require.Equal(t, check.SeverityPass, results[0].Severity, "Arbitrary role names with optimal settings should be OK")
 }
 
 func Test_SessionSettings_ConfiguredRoleMissing(t *testing.T) {
@@ -496,6 +495,7 @@ func Test_SessionSettings_ConfiguredRoleMissing(t *testing.T) {
 	checker := sessionsettings.New(queryer, cfg)
 	report, err := checker.Check(context.Background())
 	require.NoError(t, err)
+	checktest.AssertSeverityInvariant(t, report)
 
 	results := report.Results
 	require.Equal(t, 1, len(results), "Should have exactly 1 result")
@@ -515,11 +515,10 @@ func Test_SessionSettings_ConfiguredRoleMissing(t *testing.T) {
 	require.NotNil(t, foundRow, "Should find 'Role not found' row for nonexistent role")
 }
 
-func Test_SessionSettings_CustomThresholds_Warn(t *testing.T) {
+func Test_SessionSettings_CustomThreshold(t *testing.T) {
 	t.Parallel()
 
-	// With tighter thresholds: warn=2000, fail=5000
-	// statement_timeout=3000 is between 2000 and 5000 → WARN
+	// With a tighter threshold of 2000, statement_timeout=3000 → "Too high" WARN
 	settings := map[string]map[string]string{
 		"app_ro": {
 			"statement_timeout":                   "3000",
@@ -531,9 +530,8 @@ func Test_SessionSettings_CustomThresholds_Warn(t *testing.T) {
 
 	cfg := check.Config{
 		"session-settings": {
-			"roles":        "app_ro",
-			"timeout_warn": "2000",
-			"timeout_fail": "5000",
+			"roles":   "app_ro",
+			"timeout": "2000",
 		},
 	}
 
@@ -541,68 +539,27 @@ func Test_SessionSettings_CustomThresholds_Warn(t *testing.T) {
 	checker := sessionsettings.New(queryer, cfg)
 	report, err := checker.Check(context.Background())
 	require.NoError(t, err)
+	checktest.AssertSeverityInvariant(t, report)
 
 	result := report.Results[0]
 	require.Equal(t, check.SeverityWarn, result.Severity, "3000ms should WARN when threshold is 2000")
 	require.NotNil(t, result.Table)
 
-	// Both statement_timeout and transaction_timeout should be WARN
 	warnCount := 0
 	for _, row := range result.Table.Rows {
 		if row.Severity == check.SeverityWarn {
 			warnCount++
-			require.Equal(t, "≤ 2000ms", row.Cells[3], "Expected should reflect custom warn threshold")
+			require.Equal(t, "≤ 2000ms", row.Cells[3], "Expected should reflect custom threshold")
+			require.Equal(t, "Too high", row.Cells[4], "Status should be 'Too high'")
 		}
 	}
 	require.Equal(t, 2, warnCount, "Both statement_timeout and transaction_timeout should WARN")
 }
 
-func Test_SessionSettings_CustomThresholds_Fail(t *testing.T) {
+func Test_SessionSettings_DefaultThreshold(t *testing.T) {
 	t.Parallel()
 
-	// With tighter thresholds: warn=2000, fail=5000
-	// statement_timeout=7000 is above 5000 → FAIL
-	settings := map[string]map[string]string{
-		"app_ro": {
-			"statement_timeout":                   "7000",
-			"idle_in_transaction_session_timeout": "60000",
-			"transaction_timeout":                 "7000",
-			"log_min_duration_statement":          "2000",
-		},
-	}
-
-	cfg := check.Config{
-		"session-settings": {
-			"roles":        "app_ro",
-			"timeout_warn": "2000",
-			"timeout_fail": "5000",
-		},
-	}
-
-	queryer := newStaticSessionSettingsQueryer(mapToSessionSettingsRows(settings))
-	checker := sessionsettings.New(queryer, cfg)
-	report, err := checker.Check(context.Background())
-	require.NoError(t, err)
-
-	result := report.Results[0]
-	require.Equal(t, check.SeverityFail, result.Severity, "7000ms should FAIL when threshold is 5000")
-	require.NotNil(t, result.Table)
-
-	failCount := 0
-	for _, row := range result.Table.Rows {
-		if row.Severity == check.SeverityFail {
-			failCount++
-			require.Equal(t, "Too high", row.Cells[4], "Status should be 'Too high'")
-		}
-	}
-	require.Equal(t, 2, failCount, "Both statement_timeout and transaction_timeout should FAIL")
-}
-
-func Test_SessionSettings_DefaultThresholds(t *testing.T) {
-	t.Parallel()
-
-	// No config → defaults: warn=5000, fail=10000
-	// statement_timeout=7000 is between 5000 and 10000 → WARN
+	// No config → default threshold 5000; statement_timeout=7000 → WARN
 	settings := map[string]map[string]string{
 		"app_ro": {
 			"statement_timeout":                   "7000",
@@ -616,9 +573,10 @@ func Test_SessionSettings_DefaultThresholds(t *testing.T) {
 	checker := sessionsettings.New(queryer)
 	report, err := checker.Check(context.Background())
 	require.NoError(t, err)
+	checktest.AssertSeverityInvariant(t, report)
 
 	result := report.Results[0]
-	require.Equal(t, check.SeverityWarn, result.Severity, "7000ms should WARN with default thresholds (5000/10000)")
+	require.Equal(t, check.SeverityWarn, result.Severity, "7000ms should WARN with the default 5000 threshold")
 	require.NotNil(t, result.Table)
 
 	for _, row := range result.Table.Rows {
@@ -655,10 +613,11 @@ func Test_SessionSettings_ConfigOverridesDiscovery(t *testing.T) {
 	checker := sessionsettings.New(queryer, cfg)
 	report, err := checker.Check(context.Background())
 	require.NoError(t, err)
+	checktest.AssertSeverityInvariant(t, report)
 
 	results := report.Results
 	require.Equal(t, 1, len(results), "Should have exactly 1 result")
 
 	// Only api_user is checked (which has good settings), worker_user is ignored
-	require.Equal(t, check.SeverityOK, results[0].Severity, "Should only check configured roles")
+	require.Equal(t, check.SeverityPass, results[0].Severity, "Should only check configured roles")
 }

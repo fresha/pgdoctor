@@ -29,6 +29,8 @@ sql:
       - "checks/replicationlag"
       - "checks/tablevacuumhealth"
       - "checks/tableactivity"
+      - "checks/extensionversions"
+      - "checks/querystatscapacity"
     database:
       uri: "postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable"
     gen:

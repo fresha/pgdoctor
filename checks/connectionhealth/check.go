@@ -27,8 +27,9 @@ const (
 	// in low-traffic databases.
 	minConnectionsForIdleCheck = int64(20)
 
-	longIdleWarnCount = 10
-	longIdleFailCount = 50
+	// Capacity-relative: absolute counts are meaningless against pooled warm floors.
+	longIdleWarnCount = 100
+	longIdleFailCount = 500
 
 	// Pool pressure thresholds - detect when queries may be waiting for connections.
 	poolPressureActivePercent = 90.0 // Warn when >90% of connections are active
@@ -122,7 +123,7 @@ func addConnectionOverview(stats db.ConnectionStatsRow, report *check.Report) {
 	report.AddFinding(check.Finding{
 		ID:       "connection-overview",
 		Name:     "Connection Overview",
-		Severity: check.SeverityOK,
+		Severity: check.SeverityPass,
 		Details:  details,
 	})
 }
@@ -139,9 +140,8 @@ func checkConnectionSaturation(stats db.ConnectionStatsRow, report *check.Report
 	if saturationPercent < saturationWarnPercent {
 		report.AddFinding(check.Finding{
 			ID:       "connection-saturation",
-			Name:     "Connection Saturation",
-			Severity: check.SeverityOK,
-			Details:  fmt.Sprintf("Connection usage at %.1f%% (%d/%d available)", saturationPercent, used, available),
+			Name:     fmt.Sprintf("Connection Saturation: %.1f%% (%d/%d available)", saturationPercent, used, available),
+			Severity: check.SeverityPass,
 		})
 		return
 	}
@@ -172,7 +172,7 @@ func checkPoolPressure(stats db.ConnectionStatsRow, report *check.Report) {
 		report.AddFinding(check.Finding{
 			ID:       "pool-pressure",
 			Name:     "Connection Pool Pressure",
-			Severity: check.SeverityOK,
+			Severity: check.SeverityPass,
 			Details:  fmt.Sprintf("Only %d connections, pool pressure check skipped", total),
 		})
 		return
@@ -185,7 +185,7 @@ func checkPoolPressure(stats db.ConnectionStatsRow, report *check.Report) {
 		report.AddFinding(check.Finding{
 			ID:       "pool-pressure",
 			Name:     "Connection Pool Pressure",
-			Severity: check.SeverityOK,
+			Severity: check.SeverityPass,
 			Details:  fmt.Sprintf("Pool has capacity: %d active (%.1f%%), %d idle connections available", active, activePercent, idle),
 		})
 		return
@@ -215,7 +215,7 @@ func checkIdleRatio(stats db.ConnectionStatsRow, report *check.Report) {
 		report.AddFinding(check.Finding{
 			ID:       "idle-ratio",
 			Name:     "Idle Connection Ratio",
-			Severity: check.SeverityOK,
+			Severity: check.SeverityPass,
 			Details:  fmt.Sprintf("Only %d total connections, idle ratio check skipped", total),
 		})
 		return
@@ -227,7 +227,7 @@ func checkIdleRatio(stats db.ConnectionStatsRow, report *check.Report) {
 		report.AddFinding(check.Finding{
 			ID:       "idle-ratio",
 			Name:     "Idle Connection Ratio",
-			Severity: check.SeverityOK,
+			Severity: check.SeverityPass,
 			Details:  fmt.Sprintf("Idle ratio at %.1f%% (%d/%d connections idle)", idlePercent, idle, total),
 		})
 		return
@@ -246,7 +246,7 @@ func checkIdleInTransaction(rows []db.IdleInTransactionRow, report *check.Report
 		report.AddFinding(check.Finding{
 			ID:       "idle-in-transaction",
 			Name:     "Idle In Transaction",
-			Severity: check.SeverityOK,
+			Severity: check.SeverityPass,
 			Details:  "No connections stuck in 'idle in transaction' state",
 		})
 		return
@@ -272,7 +272,7 @@ func checkIdleInTransaction(rows []db.IdleInTransactionRow, report *check.Report
 		report.AddFinding(check.Finding{
 			ID:       "idle-in-transaction",
 			Name:     "Idle In Transaction",
-			Severity: check.SeverityOK,
+			Severity: check.SeverityPass,
 			Details:  "No connections stuck in 'idle in transaction' state",
 		})
 		return
@@ -313,30 +313,23 @@ func checkIdleInTransaction(rows []db.IdleInTransactionRow, report *check.Report
 	})
 }
 
-// checkLongIdleConnections detects connections idle for >30 minutes (potential connection leak).
+// checkLongIdleConnections sizes the idle-over-1h population against max_connections capacity.
 func checkLongIdleConnections(longIdle []db.LongIdleConnectionsRow, report *check.Report) {
 	count := len(longIdle)
 
-	if count < longIdleWarnCount {
-		report.AddFinding(check.Finding{
-			ID:       "long-idle",
-			Name:     "Long Idle Connections",
-			Severity: check.SeverityOK,
-			Details:  fmt.Sprintf("%d connections idle >30 minutes (threshold: %d)", count, longIdleWarnCount),
-		})
-		return
-	}
-
-	severity := check.SeverityWarn
-	if count >= longIdleFailCount {
+	severity := check.SeverityPass
+	switch {
+	case count > longIdleFailCount:
 		severity = check.SeverityFail
+	case count > longIdleWarnCount:
+		severity = check.SeverityWarn
 	}
 
 	report.AddFinding(check.Finding{
 		ID:       "long-idle",
 		Name:     "Long Idle Connections",
 		Severity: severity,
-		Details:  fmt.Sprintf("%d connections idle >30 minutes (potential connection leak)", count),
+		Details:  fmt.Sprintf("%d connections idle >1h", count),
 	})
 }
 

@@ -35,10 +35,9 @@ type settingCheck struct {
 }
 
 type checker struct {
-	queryer     SessionSettingsQueries
-	roles       []string
-	timeoutWarn int64 // default: 5000
-	timeoutFail int64 // default: 10000
+	queryer SessionSettingsQueries
+	roles   []string
+	timeout int64 // default: 5000
 }
 
 func Metadata() check.Metadata {
@@ -54,23 +53,17 @@ func Metadata() check.Metadata {
 
 func New(queryer SessionSettingsQueries, cfg ...check.Config) check.Checker {
 	c := &checker{
-		queryer:     queryer,
-		timeoutWarn: 5000,
-		timeoutFail: 10000,
+		queryer: queryer,
+		timeout: 5000,
 	}
 	if len(cfg) > 0 && cfg[0] != nil {
 		if myCfg, ok := cfg[0][Metadata().CheckID]; ok {
 			if roles, ok := myCfg["roles"]; ok {
 				c.roles = strings.Split(roles, ",")
 			}
-			if v, ok := myCfg["timeout_warn"]; ok {
+			if v, ok := myCfg["timeout"]; ok {
 				if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-					c.timeoutWarn = n
-				}
-			}
-			if v, ok := myCfg["timeout_fail"]; ok {
-				if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-					c.timeoutFail = n
+					c.timeout = n
 				}
 			}
 		}
@@ -102,7 +95,7 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 		report.AddFinding(check.Finding{
 			ID:       report.CheckID,
 			Name:     report.Name,
-			Severity: check.SeverityOK,
+			Severity: check.SeverityPass,
 			Details:  "No application roles found",
 		})
 		return report, nil
@@ -138,7 +131,7 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 	}
 
 	// Determine overall severity
-	overallSeverity := check.SeverityOK
+	overallSeverity := check.SeverityPass
 	for _, sc := range checks {
 		if sc.Severity > overallSeverity {
 			overallSeverity = sc.Severity
@@ -152,11 +145,11 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 		Severity: overallSeverity,
 	}
 
-	if overallSeverity != check.SeverityOK {
+	if overallSeverity != check.SeverityPass {
 		// Create table with only non-OK entries
 		tableRows := []check.TableRow{}
 		for _, sc := range checks {
-			if sc.Severity != check.SeverityOK {
+			if sc.Severity != check.SeverityPass {
 				tableRows = append(tableRows, check.TableRow{
 					Cells: []string{
 						sc.Role,
@@ -200,7 +193,7 @@ func (c *checker) checkUserTimeouts(s dbSessionSettings, user string) ([]setting
 	}
 
 	// Check statement_timeout
-	expectedTimeout := fmt.Sprintf("≤ %dms", c.timeoutWarn)
+	expectedTimeout := fmt.Sprintf("≤ %dms", c.timeout)
 	if stmtTimeout == 0 {
 		checks = append(checks, settingCheck{
 			Role:      user,
@@ -208,24 +201,15 @@ func (c *checker) checkUserTimeouts(s dbSessionSettings, user string) ([]setting
 			Current:   "0ms (disabled)",
 			Expected:  expectedTimeout,
 			Status:    "MUST be set",
-			Severity:  check.SeverityFail,
+			Severity:  check.SeverityWarn,
 		})
-	} else if stmtTimeout > c.timeoutFail {
+	} else if stmtTimeout > c.timeout {
 		checks = append(checks, settingCheck{
 			Role:      user,
 			Parameter: "statement_timeout",
 			Current:   fmt.Sprintf("%dms", stmtTimeout),
 			Expected:  expectedTimeout,
 			Status:    "Too high",
-			Severity:  check.SeverityFail,
-		})
-	} else if stmtTimeout > c.timeoutWarn {
-		checks = append(checks, settingCheck{
-			Role:      user,
-			Parameter: "statement_timeout",
-			Current:   fmt.Sprintf("%dms", stmtTimeout),
-			Expected:  expectedTimeout,
-			Status:    "High",
 			Severity:  check.SeverityWarn,
 		})
 	} else {
@@ -235,7 +219,7 @@ func (c *checker) checkUserTimeouts(s dbSessionSettings, user string) ([]setting
 			Current:   fmt.Sprintf("%dms", stmtTimeout),
 			Expected:  expectedTimeout,
 			Status:    "OK",
-			Severity:  check.SeverityOK,
+			Severity:  check.SeverityPass,
 		})
 	}
 
@@ -256,7 +240,7 @@ func (c *checker) checkUserTimeouts(s dbSessionSettings, user string) ([]setting
 			Current:   fmt.Sprintf("%dms", idleTimeout),
 			Expected:  "60000ms",
 			Status:    "OK",
-			Severity:  check.SeverityOK,
+			Severity:  check.SeverityPass,
 		})
 	}
 
@@ -271,24 +255,15 @@ func (c *checker) checkUserTimeouts(s dbSessionSettings, user string) ([]setting
 				Current:   "0ms (disabled)",
 				Expected:  expectedTimeout,
 				Status:    "MUST be set (PG17+)",
-				Severity:  check.SeverityFail,
+				Severity:  check.SeverityWarn,
 			})
-		} else if txTimeout > c.timeoutFail {
+		} else if txTimeout > c.timeout {
 			checks = append(checks, settingCheck{
 				Role:      user,
 				Parameter: "transaction_timeout",
 				Current:   fmt.Sprintf("%dms", txTimeout),
 				Expected:  expectedTimeout,
 				Status:    "Too high",
-				Severity:  check.SeverityFail,
-			})
-		} else if txTimeout > c.timeoutWarn {
-			checks = append(checks, settingCheck{
-				Role:      user,
-				Parameter: "transaction_timeout",
-				Current:   fmt.Sprintf("%dms", txTimeout),
-				Expected:  expectedTimeout,
-				Status:    "High",
 				Severity:  check.SeverityWarn,
 			})
 		} else {
@@ -298,7 +273,7 @@ func (c *checker) checkUserTimeouts(s dbSessionSettings, user string) ([]setting
 				Current:   fmt.Sprintf("%dms", txTimeout),
 				Expected:  expectedTimeout,
 				Status:    "OK",
-				Severity:  check.SeverityOK,
+				Severity:  check.SeverityPass,
 			})
 		}
 	}
@@ -321,7 +296,7 @@ func checkLogStatements(s dbSessionSettings, user string) ([]settingCheck, error
 			Current:   "-1 (disabled)",
 			Expected:  "2000ms",
 			Status:    "Disabled",
-			Severity:  check.SeverityFail,
+			Severity:  check.SeverityWarn,
 		})
 	} else if minDuration < 500 {
 		checks = append(checks, settingCheck{
@@ -330,7 +305,7 @@ func checkLogStatements(s dbSessionSettings, user string) ([]settingCheck, error
 			Current:   fmt.Sprintf("%dms", minDuration),
 			Expected:  "2000ms",
 			Status:    "Too low",
-			Severity:  check.SeverityFail,
+			Severity:  check.SeverityWarn,
 		})
 	} else {
 		checks = append(checks, settingCheck{
@@ -339,7 +314,7 @@ func checkLogStatements(s dbSessionSettings, user string) ([]settingCheck, error
 			Current:   fmt.Sprintf("%dms", minDuration),
 			Expected:  "2000ms",
 			Status:    "OK",
-			Severity:  check.SeverityOK,
+			Severity:  check.SeverityPass,
 		})
 	}
 

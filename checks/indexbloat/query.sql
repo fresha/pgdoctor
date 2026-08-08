@@ -88,8 +88,7 @@ WITH index_info AS (
 )
 
 SELECT
-  schemaname
-  , tablename
+  schemaname || '.' || tablename AS table_name
   , indexname
   , actual_pages
   , est_pages
@@ -101,5 +100,8 @@ SELECT
     ELSE 0
   END AS bloat_percent
 FROM bloat_estimate
-WHERE actual_pages > est_pages
+WHERE
+  actual_pages > est_pages
+  -- 200MB listing floor; any index wasting >=2GiB is necessarily larger, so no arm is lost
+  AND actual_bytes >= 200 * 1024 * 1024
 ORDER BY bloat_percent DESC, bloat_bytes DESC;

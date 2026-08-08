@@ -5,8 +5,9 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"math"
+	"sort"
 	"strings"
-	"time"
 
 	"github.com/fresha/pgdoctor/check"
 	"github.com/fresha/pgdoctor/db"
@@ -28,20 +29,22 @@ type checker struct {
 }
 
 const (
-	// Large table threshold.
-	largeTableMinRows = 1_000_000  // 1M rows
-	veryLargeTableMin = 10_000_000 // 10M rows
+	largeTableMinRows = 1_000_000
 
-	// Stale vacuum thresholds.
-	staleVacuumWarnDays = 7  // Warning after 7 days without vacuum/analyze
-	staleVacuumFailDays = 25 // Error after 25 days without vacuum/analyze
+	defaultVacuumScaleFactor = 0.2
+	defaultVacuumThreshold   = 50
 
-	// Minimum rows for staleness checks (avoid noise from tiny tables).
-	staleCheckMinRows = 1000
+	secondsPerDay = 24 * 60 * 60
+	secondsPerHr  = 60 * 60
 
-	// Analyze needed thresholds (modifications since last analyze).
-	analyzeNeededWarn = 100_000 // Warning at 100K modifications
-	analyzeNeededFail = 500_000 // Fail at 500K modifications
+	staleVacuumWarnSeconds = 7 * secondsPerDay
+	staleVacuumFailSeconds = 25 * secondsPerDay
+
+	pendingWorkWarnFloor = 250_000
+	pendingWorkFailFloor = 500_000
+
+	neverLabel = "never"
+	noEstimate = "-"
 )
 
 func Metadata() check.Metadata {
@@ -76,9 +79,19 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 	checkAutovacuumDisabled(rows, report)
 	checkLargeTableDefaults(rows, report)
 	checkVacuumStale(rows, report)
-	checkAnalyzeNeeded(rows, report)
 
 	return report, nil
+}
+
+// maxRowSeverity floors at Warn: this finding only exists once a row warrants attention.
+func maxRowSeverity(rows []check.TableRow) check.Severity {
+	severity := check.SeverityWarn
+	for _, row := range rows {
+		if row.Severity > severity {
+			severity = row.Severity
+		}
+	}
+	return severity
 }
 
 func checkAutovacuumDisabled(rows []db.TableVacuumHealthRow, report *check.Report) {
@@ -93,7 +106,7 @@ func checkAutovacuumDisabled(rows []db.TableVacuumHealthRow, report *check.Repor
 		report.AddFinding(check.Finding{
 			ID:       "autovacuum-disabled",
 			Name:     "Autovacuum Disabled Tables",
-			Severity: check.SeverityOK,
+			Severity: check.SeverityPass,
 			Details:  "No tables found with autovacuum disabled",
 		})
 		return
@@ -107,44 +120,51 @@ func checkAutovacuumDisabled(rows []db.TableVacuumHealthRow, report *check.Repor
 	})
 }
 
+// largeDefaultEntry carries the derived values needed to render and sort a row.
+type largeDefaultEntry struct {
+	row     db.TableVacuumHealthRow
+	trigger int64
+	pending int64
+}
+
 func checkLargeTableDefaults(rows []db.TableVacuumHealthRow, report *check.Report) {
-	var tablesUsingDefaults []db.TableVacuumHealthRow
+	var entries []largeDefaultEntry
 	for _, row := range rows {
 		if row.EstimatedRows.Int64 >= largeTableMinRows && isUsingDefaultSettings(row.Reloptions.String) {
-			tablesUsingDefaults = append(tablesUsingDefaults, row)
+			entries = append(entries, largeDefaultEntry{
+				row:     row,
+				trigger: defaultVacuumTrigger(row.EstimatedRows.Int64),
+				pending: row.NDeadTup.Int64 + row.NInsSinceVacuum.Int64,
+			})
 		}
 	}
 
-	if len(tablesUsingDefaults) == 0 {
+	if len(entries) == 0 {
 		report.AddFinding(check.Finding{
 			ID:       "large-table-defaults",
 			Name:     "Large Table Vacuum Defaults",
-			Severity: check.SeverityOK,
+			Severity: check.SeverityPass,
 			Details:  "No large tables (>1M rows) found using default autovacuum settings",
 		})
 		return
 	}
 
-	var tableRows []check.TableRow
-	for _, row := range tablesUsingDefaults {
-		severity := check.SeverityWarn
-		if row.EstimatedRows.Int64 >= veryLargeTableMin {
-			severity = check.SeverityFail
-		}
+	sort.SliceStable(entries, func(i, j int) bool {
+		return entries[i].pending > entries[j].pending
+	})
 
-		// Pending work = dead tuples + inserts since vacuum (PG14+)
-		pendingWork := row.NDeadTup.Int64 + row.NInsSinceVacuum.Int64
-
+	tableRows := make([]check.TableRow, 0, len(entries))
+	for _, e := range entries {
 		tableRows = append(tableRows, check.TableRow{
 			Cells: []string{
-				row.TableName.String,
-				formatRowCount(row.EstimatedRows.Int64),
-				check.FormatBytes(row.TableSizeBytes.Int64),
-				formatRowCount(pendingWork),
-				formatTimestamp(row.LastAutovacuum),
-				fmt.Sprintf("%d", row.AutovacuumCount.Int64),
+				e.row.TableName.String,
+				check.FormatNumber(e.row.EstimatedRows.Int64),
+				check.FormatBytes(e.row.TableSizeBytes.Int64),
+				check.FormatNumber(e.trigger),
+				check.FormatNumber(e.pending),
+				estNextVacuum(e.trigger, e.pending, e.row.LastVacuumAgeSeconds),
 			},
-			Severity: severity,
+			Severity: check.SeverityWarn,
 		})
 	}
 
@@ -152,82 +172,112 @@ func checkLargeTableDefaults(rows []db.TableVacuumHealthRow, report *check.Repor
 		ID:       "large-table-defaults",
 		Name:     "Large Table Vacuum Defaults",
 		Severity: check.SeverityWarn,
-		Details:  fmt.Sprintf("Found %d large table(s) using default autovacuum settings", len(tablesUsingDefaults)),
+		Details:  fmt.Sprintf("Found %d large table(s) using default autovacuum settings", len(entries)),
 		Table: &check.Table{
-			Headers: []string{"Table", "Rows", "Size", "Pending Work", "Last Autovacuum", "Vacuum Count"},
+			Headers: []string{"Table", "Rows", "Size", "Trigger At", "Pending", "Est. Next Vacuum"},
 			Rows:    tableRows,
 		},
 	})
 }
 
-func checkVacuumStale(rows []db.TableVacuumHealthRow, report *check.Report) {
-	now := time.Now()
-	warnThreshold := now.Add(-time.Duration(staleVacuumWarnDays) * 24 * time.Hour)
-	failThreshold := now.Add(-time.Duration(staleVacuumFailDays) * 24 * time.Hour)
+// defaultVacuumTrigger is the dead-tuple count default autovacuum waits for.
+func defaultVacuumTrigger(estimatedRows int64) int64 {
+	return int64(defaultVacuumScaleFactor*float64(estimatedRows)) + defaultVacuumThreshold
+}
 
-	var staleTables []db.TableVacuumHealthRow
+// estNextVacuum assumes dead tuples keep accumulating at their post-vacuum rate.
+func estNextVacuum(trigger, pending int64, lastVacuumAge pgtype.Int8) string {
+	if pending == 0 {
+		return noEstimate
+	}
+	if pending >= trigger {
+		return "overdue"
+	}
+	if !lastVacuumAge.Valid || lastVacuumAge.Int64 <= 0 {
+		return noEstimate
+	}
+
+	rate := float64(pending) / float64(lastVacuumAge.Int64)
+	estSeconds := float64(trigger-pending) / rate
+
+	if days := estSeconds / secondsPerDay; days >= 2 {
+		return fmt.Sprintf("~%dd", int64(math.Round(days)))
+	}
+	if hours := estSeconds / secondsPerHr; hours >= 2 {
+		return fmt.Sprintf("~%dh", int64(math.Round(hours)))
+	}
+	return "<1h"
+}
+
+// staleEntry is a row that tripped a staleness tier, carrying the values needed
+// to render and sort it.
+type staleEntry struct {
+	row            db.TableVacuumHealthRow
+	severity       check.Severity
+	pendingWork    int64
+	lastVacuumAge  pgtype.Int8
+	lastAnalyzeAge pgtype.Int8
+}
+
+// checkVacuumStale lists tables that are both overdue AND carry real pending work,
+// on either the vacuum arm (dead + inserts) or the analyze arm (mods since analyze).
+func checkVacuumStale(rows []db.TableVacuumHealthRow, report *check.Report) {
+	var entries []staleEntry
 	for _, row := range rows {
-		// Skip tiny tables to avoid noise.
-		if row.EstimatedRows.Int64 < staleCheckMinRows {
+		vacuumWork := row.NDeadTup.Int64 + row.NInsSinceVacuum.Int64
+		analyzeWork := row.NModSinceAnalyze.Int64
+
+		severity := staleSeverity(vacuumWork, analyzeWork, row.LastVacuumAgeSeconds, row.LastAnalyzeAgeSeconds)
+		if severity == check.SeverityPass {
 			continue
 		}
 
-		lastVacuum := getTimestamp(row.LastVacuumAny)
-		lastAnalyze := getTimestamp(row.LastAnalyzeAny)
-
-		// Consider stale if either vacuum or analyze is old.
-		if lastVacuum.Before(warnThreshold) || lastAnalyze.Before(warnThreshold) {
-			staleTables = append(staleTables, row)
-		}
+		entries = append(entries, staleEntry{
+			row:            row,
+			severity:       severity,
+			pendingWork:    max(vacuumWork, analyzeWork),
+			lastVacuumAge:  row.LastVacuumAgeSeconds,
+			lastAnalyzeAge: row.LastAnalyzeAgeSeconds,
+		})
 	}
 
-	if len(staleTables) == 0 {
+	if len(entries) == 0 {
 		report.AddFinding(check.Finding{
 			ID:       "vacuum-stale",
 			Name:     "Stale Vacuum Activity",
-			Severity: check.SeverityOK,
-			Details:  "All tables have been vacuumed and analyzed within the last 7 days",
+			Severity: check.SeverityPass,
+			Details:  "No tables are overdue for vacuum or analyze with significant pending work",
 		})
 		return
 	}
 
-	var tableRows []check.TableRow
-	for _, row := range staleTables {
-		lastVacuum := getTimestamp(row.LastVacuumAny)
-		lastAnalyze := getTimestamp(row.LastAnalyzeAny)
-
-		// Oldest activity determines severity.
-		oldestActivity := lastVacuum
-		if lastAnalyze.Before(oldestActivity) {
-			oldestActivity = lastAnalyze
+	sort.SliceStable(entries, func(i, j int) bool {
+		if entries[i].severity != entries[j].severity {
+			return entries[i].severity > entries[j].severity
 		}
+		return entries[i].pendingWork > entries[j].pendingWork
+	})
 
-		severity := check.SeverityWarn
-		if oldestActivity.Before(failThreshold) {
-			severity = check.SeverityFail
-		}
-
-		// Pending work = dead tuples + inserts since vacuum (PG14+)
-		pendingWork := row.NDeadTup.Int64 + row.NInsSinceVacuum.Int64
-
+	tableRows := make([]check.TableRow, 0, len(entries))
+	for _, e := range entries {
 		tableRows = append(tableRows, check.TableRow{
 			Cells: []string{
-				row.TableName.String,
-				formatRowCount(row.EstimatedRows.Int64),
-				check.FormatBytes(row.TableSizeBytes.Int64),
-				formatRowCount(pendingWork),
-				formatTimeSince(lastVacuum),
-				formatTimeSince(lastAnalyze),
+				e.row.TableName.String,
+				check.FormatNumber(e.row.EstimatedRows.Int64),
+				check.FormatBytes(e.row.TableSizeBytes.Int64),
+				check.FormatNumber(e.pendingWork),
+				formatActivity(e.lastVacuumAge, e.row.VacuumCount.Int64+e.row.AutovacuumCount.Int64),
+				formatActivity(e.lastAnalyzeAge, e.row.AnalyzeCount.Int64+e.row.AutoanalyzeCount.Int64),
 			},
-			Severity: severity,
+			Severity: e.severity,
 		})
 	}
 
 	report.AddFinding(check.Finding{
 		ID:       "vacuum-stale",
 		Name:     "Stale Vacuum Activity",
-		Severity: check.SeverityWarn,
-		Details:  fmt.Sprintf("Found %d table(s) with stale vacuum or analyze activity", len(tableRows)),
+		Severity: maxRowSeverity(tableRows),
+		Details:  fmt.Sprintf("Found %d table(s) overdue for vacuum or analyze with significant pending work", len(tableRows)),
 		Table: &check.Table{
 			Headers: []string{"Table", "Rows", "Size", "Pending Work", "Last Vacuum", "Last Analyze"},
 			Rows:    tableRows,
@@ -235,58 +285,37 @@ func checkVacuumStale(rows []db.TableVacuumHealthRow, report *check.Report) {
 	})
 }
 
-func checkAnalyzeNeeded(rows []db.TableVacuumHealthRow, report *check.Report) {
-	var needsAnalyze []db.TableVacuumHealthRow
-	for _, row := range rows {
-		// Skip tiny tables to avoid noise.
-		if row.EstimatedRows.Int64 < staleCheckMinRows {
-			continue
-		}
+// staleSeverity evaluates FAIL then WARN; either arm at a tier trips that tier,
+// and a table that was never vacuumed/analyzed is treated as infinitely stale.
+func staleSeverity(vacuumWork, analyzeWork int64, lastVacuumAge, lastAnalyzeAge pgtype.Int8) check.Severity {
+	vacuumAge := staleAge(lastVacuumAge)
+	analyzeAge := staleAge(lastAnalyzeAge)
 
-		if row.NModSinceAnalyze.Int64 >= analyzeNeededWarn {
-			needsAnalyze = append(needsAnalyze, row)
-		}
+	if (vacuumAge > staleVacuumFailSeconds && vacuumWork >= pendingWorkFailFloor) ||
+		(analyzeAge > staleVacuumFailSeconds && analyzeWork >= pendingWorkFailFloor) {
+		return check.SeverityFail
 	}
-
-	if len(needsAnalyze) == 0 {
-		report.AddFinding(check.Finding{
-			ID:       "analyze-needed",
-			Name:     "Table Statistics Staleness",
-			Severity: check.SeverityOK,
-			Details:  "No tables found with excessive modifications since last analyze",
-		})
-		return
+	if (vacuumAge > staleVacuumWarnSeconds && vacuumWork >= pendingWorkWarnFloor) ||
+		(analyzeAge > staleVacuumWarnSeconds && analyzeWork >= pendingWorkWarnFloor) {
+		return check.SeverityWarn
 	}
+	return check.SeverityPass
+}
 
-	var tableRows []check.TableRow
-	for _, row := range needsAnalyze {
-		severity := check.SeverityWarn
-		if row.NModSinceAnalyze.Int64 >= analyzeNeededFail {
-			severity = check.SeverityFail
-		}
-
-		tableRows = append(tableRows, check.TableRow{
-			Cells: []string{
-				row.TableName.String,
-				formatRowCount(row.EstimatedRows.Int64),
-				formatRowCount(row.NModSinceAnalyze.Int64),
-				fmt.Sprintf("%d", row.AutoanalyzeCount.Int64),
-				formatTimeSince(getTimestamp(row.LastAnalyzeAny)),
-			},
-			Severity: severity,
-		})
+// staleAge treats "never ran" as infinitely stale.
+func staleAge(age pgtype.Int8) int64 {
+	if !age.Valid {
+		return math.MaxInt64
 	}
+	return age.Int64
+}
 
-	report.AddFinding(check.Finding{
-		ID:       "analyze-needed",
-		Name:     "Table Statistics Staleness",
-		Severity: check.SeverityWarn,
-		Details:  fmt.Sprintf("Found %d table(s) with stale statistics (many modifications since last ANALYZE)", len(needsAnalyze)),
-		Table: &check.Table{
-			Headers: []string{"Table", "Rows", "Mods Since Analyze", "Analyze Count", "Last Analyze"},
-			Rows:    tableRows,
-		},
-	})
+// formatActivity renders "<age> (<lifetime count>)", or "never" when the action never ran.
+func formatActivity(age pgtype.Int8, count int64) string {
+	if !age.Valid {
+		return neverLabel
+	}
+	return fmt.Sprintf("%s (%d)", formatAge(age.Int64), count)
 }
 
 // Helper functions.
@@ -302,42 +331,12 @@ func isUsingDefaultSettings(reloptions string) bool {
 	return !strings.Contains(strings.ToLower(reloptions), "autovacuum_vacuum_scale_factor")
 }
 
-func formatRowCount(count int64) string {
-	if count >= 1_000_000_000 {
-		return fmt.Sprintf("%.2fB", float64(count)/1_000_000_000)
-	}
-	if count >= 1_000_000 {
-		return fmt.Sprintf("%.1fM", float64(count)/1_000_000)
-	}
-	if count >= 1_000 {
-		return fmt.Sprintf("%.1fK", float64(count)/1_000)
-	}
-	return fmt.Sprintf("%d", count)
-}
-
-func formatTimestamp(ts pgtype.Timestamptz) string {
-	if ts.Valid {
-		return ts.Time.Format("2006-01-02 15:04")
-	}
-	return "never"
-}
-
-func getTimestamp(ts pgtype.Timestamptz) time.Time {
-	if ts.Valid {
-		return ts.Time
-	}
-	return time.Time{}
-}
-
-func formatTimeSince(t time.Time) string {
-	if t.IsZero() {
-		return "never"
-	}
-	since := time.Since(t)
-	days := int(since.Hours() / 24)
+// formatAge renders an age in whole days, falling back to hours.
+func formatAge(seconds int64) string {
+	days := seconds / secondsPerDay
 	if days == 0 {
-		hours := int(since.Hours())
-		if hours == 0 {
+		hours := seconds / secondsPerHr
+		if hours <= 0 {
 			return "just now"
 		}
 		return fmt.Sprintf("%dh ago", hours)

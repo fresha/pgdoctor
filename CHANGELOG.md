@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **check**: `InstanceMetadata` gains `IsReadReplica`, populated by the caller like every other field, so a check that is inapplicable on a physical read replica can scope itself instead of reporting a primary-only expectation as a failure ([#78](https://github.com/emancu/pgdoctor/issues/78)).
+
 ### Fixed
 
 - **cli**: the summary's `N info` tally counts again. It switched on report severity, which a `SeverityInfo` finding never raises above PASS, so the branch was unreachable and information-only checks were tallied as passing ([#72](https://github.com/emancu/pgdoctor/pull/72)).

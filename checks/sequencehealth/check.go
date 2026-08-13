@@ -56,8 +56,8 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 		report.AddFinding(check.Finding{
 			ID:       report.CheckID,
 			Name:     report.Name,
-			Severity: check.SeverityWarn,
-			Details:  "No sequences found to check",
+			Severity: check.SeverityPass,
+			Details:  "No sequences found; expected for a schema using UUID primary keys",
 		})
 		return report, nil
 	}

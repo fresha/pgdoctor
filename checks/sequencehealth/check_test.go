@@ -71,9 +71,9 @@ func TestSequenceHealth_NoSequences(t *testing.T) {
 	report, err := checker.Check(context.Background())
 
 	require.NoError(t, err)
-	require.Equal(t, check.SeverityWarn, report.Severity)
+	require.Equal(t, check.SeverityPass, report.Severity)
 	require.Equal(t, 1, len(report.Results))
-	require.Contains(t, report.Results[0].Details, "No sequences found")
+	require.Contains(t, report.Results[0].Details, "No sequences found; expected for a schema using UUID primary keys")
 }
 
 func TestSequenceHealth_AllHealthy(t *testing.T) {

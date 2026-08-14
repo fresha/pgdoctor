@@ -631,7 +631,7 @@ func TestTempUsage_UnattributableSpillKeepsTheSeverity(t *testing.T) {
 		{
 			"pg_stat_statements unavailable",
 			&mockQueryer{row: row, pgssOK: false},
-			"pg_stat_statements is not available",
+			"pg_stat_statements is unavailable or outdated",
 		},
 		{
 			// The gap query names the reasons, so the finding says why rather than

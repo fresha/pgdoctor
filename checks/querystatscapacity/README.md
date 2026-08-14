@@ -3,7 +3,7 @@
 Reports how full the `pg_stat_statements` entry table is and how fast it is discarding entries, because
 every other check that reads that view is only as good as the sample left in it.
 
-> **Note**: This check reads `pg_stat_statements`. When the extension is not installed, not preloaded, or
+> **Note**: This check reads `pg_stat_statements`. When the extension is not installed, not preloaded, older than 1.9, or
 > not reachable through `search_path`, it reports SKIP: the table is cluster-wide, so its absence here says nothing
 > about whether the shared hash is evicting, and nothing was inspected.
 

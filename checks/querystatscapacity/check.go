@@ -31,8 +31,6 @@ const (
 )
 
 // QueryStatsCapacityQueries defines the database queries needed by this check.
-// HasPgStatStatements is generated from partition-usage's query.sql: sqlc query
-// names are global to the shared db package, so it is declared, not redefined.
 type QueryStatsCapacityQueries interface {
 	HasPgStatStatements(context.Context) (pgtype.Bool, error)
 	QueryStatsCapacity(context.Context) (db.QueryStatsCapacityRow, error)
@@ -75,9 +73,9 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 	if !available.Bool {
 		report.AddFinding(check.Finding{
 			ID:       usageID,
-			Name:     usageName + ": pg_stat_statements not available",
+			Name:     usageName + ": pg_stat_statements unavailable or outdated",
 			Severity: check.SeveritySkip,
-			Details:  "pg_stat_statements is not available, so its capacity cannot be inspected.",
+			Details:  "pg_stat_statements is unavailable or outdated, so its capacity cannot be inspected.",
 		})
 		report.Severity = check.SeveritySkip
 

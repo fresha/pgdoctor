@@ -164,6 +164,9 @@ type InstanceMetadata struct {
 	AvailabilityZone string
 	SecondaryAZ      string
 
+	// Replication role
+	IsReadReplica bool // Physical read replica of another instance; false also means undetermined
+
 	// Storage autoscaling
 	StorageAutoscaling    bool
 	MaxStorageThresholdGB int

@@ -1,6 +1,7 @@
 package check_test
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -43,4 +44,29 @@ func TestSeverity_String(t *testing.T) {
 			require.Equal(t, tt.expect, tt.severity.String())
 		})
 	}
+}
+
+func TestInstanceMetadata_ContextRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	metadata := &check.InstanceMetadata{InstanceID: "db-1", IsReadReplica: true}
+
+	ctx := check.ContextWithInstanceMetadata(context.Background(), metadata)
+
+	got := check.InstanceMetadataFromContext(ctx)
+	require.Same(t, metadata, got)
+	require.True(t, got.IsReadReplica)
+}
+
+func TestInstanceMetadataFromContext_Absent(t *testing.T) {
+	t.Parallel()
+
+	require.Nil(t, check.InstanceMetadataFromContext(context.Background()))
+}
+
+// false is the undetermined default: callers that never populate it must still read it safely.
+func TestInstanceMetadata_ReadReplicaDefault(t *testing.T) {
+	t.Parallel()
+
+	require.False(t, check.InstanceMetadata{}.IsReadReplica)
 }

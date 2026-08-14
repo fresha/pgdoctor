@@ -310,7 +310,7 @@ func checkWorkMem(s dbVacuumSettings, report *check.Report, meta *check.Instance
 	workMemMB := workMemKB / 1024
 
 	maxConnections := s.fetchInt64("max_connections", 100) // PostgreSQL default
-	activeConnections := s.fetchInt64("active_connections", 0)
+	observedBackends := s.fetchInt64("active_connections", 0)
 
 	if workMemMB < 4 {
 		report.AddFinding(check.Finding{
@@ -331,52 +331,39 @@ func checkWorkMem(s dbVacuumSettings, report *check.Report, meta *check.Instance
 
 	availableRAMMB := int64(meta.MemoryGB * 1024)
 
-	// Calculate worst-case: all connections use work_mem
+	// Observed backends are the graded numerator and RAM the denominator; without
+	// either, a percentage is meaningless (0/0 is NaN and silently passes).
+	if observedBackends <= 0 || availableRAMMB <= 0 {
+		return
+	}
+
+	observedRAMMB := workMemMB * observedBackends
+	observedPercent := (float64(observedRAMMB) / float64(availableRAMMB)) * 100
+
 	worstCaseRAMMB := workMemMB * maxConnections
 	worstCasePercent := (float64(worstCaseRAMMB) / float64(availableRAMMB)) * 100
 
-	// Calculate typical: active connections use work_mem
-	typicalRAMMB := workMemMB * activeConnections
-	typicalPercent := (float64(typicalRAMMB) / float64(availableRAMMB)) * 100
-
-	// Flag dangerous configurations
-	if worstCasePercent > 80 {
+	if observedPercent > 80 {
 		report.AddFinding(check.Finding{
 			Name:     "Dangerous work_mem configuration",
 			ID:       "work_mem",
 			Severity: check.SeverityFail,
-			Details:  workMemBudgetDetails(workMemMB, maxConnections, worstCaseRAMMB, worstCasePercent, meta.MemoryGB),
-			Debug: workMemBudgetDebug(meta, worstCaseRAMMB, worstCasePercent, activeConnections, typicalRAMMB, typicalPercent,
-				"This configuration can cause out-of-memory errors when connections spike.\n"+
+			Details:  workMemBudgetDetails(workMemMB, observedBackends, observedRAMMB, observedPercent, meta.MemoryGB, maxConnections, worstCaseRAMMB, worstCasePercent),
+			Debug: workMemBudgetDebug(meta, observedBackends, observedRAMMB, observedPercent, maxConnections, worstCaseRAMMB, worstCasePercent,
+				"At the current backend count this can cause out-of-memory errors.\n"+
 					"Note: Each query operation (sort/hash) can use work_mem multiple times."),
 		})
 		return
 	}
 
-	if worstCasePercent > 50 {
+	if observedPercent > 50 {
 		report.AddFinding(check.Finding{
 			Name:     "Risky work_mem configuration",
 			ID:       "work_mem",
 			Severity: check.SeverityWarn,
-			Details:  workMemBudgetDetails(workMemMB, maxConnections, worstCaseRAMMB, worstCasePercent, meta.MemoryGB),
-			Debug: workMemBudgetDebug(meta, worstCaseRAMMB, worstCasePercent, activeConnections, typicalRAMMB, typicalPercent,
-				"While currently safe, connection spikes could cause memory pressure."),
-		})
-		return
-	}
-
-	if activeConnections > 0 && typicalPercent > 40 {
-		report.AddFinding(check.Finding{
-			Name:     "High current work_mem usage",
-			ID:       "work_mem",
-			Severity: check.SeverityWarn,
-			Details: fmt.Sprintf("work_mem is %dMB with %d active connections on %s (%.0fGB RAM)\n\n"+
-				"Current RAM usage: ~%dMB (%.1f%% of available RAM)\n"+
-				"Worst-case with max connections (%d): %dMB (%.1f%%)\n\n"+
-				"High memory usage from current connections. Monitor for memory pressure.",
-				workMemMB, activeConnections, meta.InstanceClass, meta.MemoryGB,
-				typicalRAMMB, typicalPercent,
-				maxConnections, worstCaseRAMMB, worstCasePercent),
+			Details:  workMemBudgetDetails(workMemMB, observedBackends, observedRAMMB, observedPercent, meta.MemoryGB, maxConnections, worstCaseRAMMB, worstCasePercent),
+			Debug: workMemBudgetDebug(meta, observedBackends, observedRAMMB, observedPercent, maxConnections, worstCaseRAMMB, worstCasePercent,
+				"Still safe today, but more backends or multi-sort queries could cause memory pressure."),
 		})
 		return
 	}
@@ -387,18 +374,21 @@ func maintenanceBudgetDetails(maintenanceMemMB, autovacuumMaxWorkers, totalBudge
 		maintenanceMemMB, autovacuumMaxWorkers, totalBudgetMB, budgetPercent, memoryGB)
 }
 
-func workMemBudgetDetails(workMemMB, maxConnections, worstCaseRAMMB int64, worstCasePercent, memoryGB float64) string {
-	return fmt.Sprintf("work_mem %dMB × max_connections %d → worst case %dMB (%.1f%% of %.0fGB RAM)",
-		workMemMB, maxConnections, worstCaseRAMMB, worstCasePercent, memoryGB)
+func workMemBudgetDetails(workMemMB, observedBackends, observedRAMMB int64, observedPercent, memoryGB float64, maxConnections, worstCaseRAMMB int64, worstCasePercent float64) string {
+	return fmt.Sprintf("work_mem %dMB × %d backends → %dMB (%.1f%% of %.0fGB RAM)\n"+
+		"Worst case at max_connections %d: %dMB (%.1f%%) — only if every connection slot fills.",
+		workMemMB, observedBackends, observedRAMMB, observedPercent, memoryGB,
+		maxConnections, worstCaseRAMMB, worstCasePercent)
 }
 
-func workMemBudgetDebug(meta *check.InstanceMetadata, worstCaseRAMMB int64, worstCasePercent float64, activeConnections, typicalRAMMB int64, typicalPercent float64, advisory string) string {
+func workMemBudgetDebug(meta *check.InstanceMetadata, observedBackends, observedRAMMB int64, observedPercent float64, maxConnections, worstCaseRAMMB int64, worstCasePercent float64, advisory string) string {
 	return fmt.Sprintf("Instance: %s (%.0fGB RAM)\n"+
-		"Worst-case RAM usage: %dMB (%.1f%% of available RAM)\n"+
-		"Current active connections: %d using ~%dMB (%.1f%%)\n\n%s",
+		"Observed backends: %d using ~%dMB (%.1f%% of available RAM)\n"+
+		"Worst case at max_connections %d: %dMB (%.1f%%) — shown for context, not graded\n"+
+		"Backend count is a single sample from pg_stat_activity; a quiet window under-reports.\n\n%s",
 		meta.InstanceClass, meta.MemoryGB,
-		worstCaseRAMMB, worstCasePercent,
-		activeConnections, typicalRAMMB, typicalPercent,
+		observedBackends, observedRAMMB, observedPercent,
+		maxConnections, worstCaseRAMMB, worstCasePercent,
 		advisory)
 }
 

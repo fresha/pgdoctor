@@ -236,6 +236,8 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 }
 ```
 
+Metadata is supplied by the caller through `check.ContextWithInstanceMetadata` and is never read from the database, so every field carries whatever the caller knew — the standalone CLI supplies none of it. `IsReadReplica` is `false` both for a primary and for a caller that never determined the role: scope a check off `true`, and never infer "this is a primary" from `false`. Aurora readers are cluster members that expose no RDS read-replica source, so they report `false` too.
+
 ## SQL Query Conventions
 
 All queries must be production-safe: read-only, no locks, < 1 second execution.

@@ -470,7 +470,7 @@ func Test_ExtensionUnavailable(t *testing.T) {
 	assert.Equal(t, usageID, report.Results[0].ID)
 	assert.Equal(t, check.SeveritySkip, report.Results[0].Severity)
 	// A skipped report renders the Details, not the finding name.
-	assert.Contains(t, report.Results[0].Details, "not available")
+	assert.Contains(t, report.Results[0].Details, "unavailable or outdated")
 }
 
 func Test_QueryError(t *testing.T) {

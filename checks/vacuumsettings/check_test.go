@@ -2,6 +2,7 @@ package vacuumsettings_test
 
 import (
 	"context"
+	"maps"
 	"testing"
 
 	"github.com/emancu/pgdoctor/check"
@@ -59,16 +60,20 @@ func optimalVacuumSettings() map[string]string {
 		"maintenance_work_mem":            "131072", // 128MB (128MB × 4 workers = 512MB = 6.25% of 8GB RAM)
 		"vacuum_cost_delay":               "5",
 		"vacuum_cost_limit":               "300",
-		"work_mem":                        "16384", // 16MB (16MB × 100 connections = 1600MB = 19.5% of 8GB RAM)
+		"work_mem":                        "16384", // 16MB (16MB × 10 backends = 160MB = 1.95% of 8GB RAM)
 		"max_connections":                 "100",
 		"active_connections":              "10",
 	}
 }
 
-func overrideOptimalWith(name string, value string) []db.VacuumSettingsRow {
+func overrideOptimalWithAll(overrides map[string]string) []db.VacuumSettingsRow {
 	settings := optimalVacuumSettings()
-	settings[name] = value
+	maps.Copy(settings, overrides)
 	return mapToVacuumSettingsRows(settings)
+}
+
+func overrideOptimalWith(name string, value string) []db.VacuumSettingsRow {
+	return overrideOptimalWithAll(map[string]string{name: value})
 }
 
 /*
@@ -169,9 +174,16 @@ func Test_VacuumSettings(t *testing.T) {
 		},
 		{
 			Name: "work_mem very high",
-			Rows: overrideOptimalWith("work_mem", "2097152"), // 2GB (2048MB × 100 connections = 204800MB = 2500% of 8GB RAM!)
+			Rows: overrideOptimalWith("work_mem", "2097152"), // 2GB (2048MB × 10 backends = 20480MB = 250% of 8GB RAM)
 			Expected: []ExpectedResult{
 				{"work_mem", check.SeverityFail}, // Correctly fails due to dangerous RAM budget
+			},
+		},
+		{
+			Name: "work_mem safe behind a connection pooler",
+			Rows: overrideOptimalWithAll(map[string]string{"work_mem": "49152", "max_connections": "5000"}),
+			Expected: []ExpectedResult{
+				{"vacuum-settings", check.SeverityPass},
 			},
 		},
 		// Cost settings tests
@@ -235,8 +247,7 @@ func Test_VacuumSettings_RAMBudgetMessages(t *testing.T) {
 	// All cases run against mockMetadata: db.t4g.large, 8GB RAM.
 	tests := []struct {
 		Name          string
-		Setting       string
-		Value         string
+		Overrides     map[string]string
 		FindingID     string
 		Severity      check.Severity
 		Details       string
@@ -244,37 +255,37 @@ func Test_VacuumSettings_RAMBudgetMessages(t *testing.T) {
 	}{
 		{
 			Name:      "work_mem risky (WARN)",
-			Setting:   "work_mem",
-			Value:     "49152", // 48MB × 100 connections = 4800MB = 58.6% of 8GB
+			Overrides: map[string]string{"work_mem": "49152", "active_connections": "100", "max_connections": "500"},
 			FindingID: "work_mem",
 			Severity:  check.SeverityWarn,
-			Details:   "work_mem 48MB × max_connections 100 → worst case 4800MB (58.6% of 8GB RAM)",
+			Details: "work_mem 48MB × 100 backends → 4800MB (58.6% of 8GB RAM)\n" +
+				"Worst case at max_connections 500: 24000MB (293.0%) — only if every connection slot fills.",
 			DebugContains: []string{
 				"Instance: db.t4g.large (8GB RAM)",
-				"Worst-case RAM usage: 4800MB (58.6% of available RAM)",
-				"Current active connections: 10 using ~480MB (5.9%)",
-				"While currently safe, connection spikes could cause memory pressure.",
+				"Observed backends: 100 using ~4800MB (58.6% of available RAM)",
+				"Worst case at max_connections 500: 24000MB (293.0%) — shown for context, not graded",
+				"Backend count is a single sample from pg_stat_activity; a quiet window under-reports.",
+				"Still safe today, but more backends or multi-sort queries could cause memory pressure.",
 			},
 		},
 		{
 			Name:      "work_mem dangerous (FAIL)",
-			Setting:   "work_mem",
-			Value:     "2097152", // 2048MB × 100 connections = 204800MB = 2500% of 8GB
+			Overrides: map[string]string{"work_mem": "2097152"},
 			FindingID: "work_mem",
 			Severity:  check.SeverityFail,
-			Details:   "work_mem 2048MB × max_connections 100 → worst case 204800MB (2500.0% of 8GB RAM)",
+			Details: "work_mem 2048MB × 10 backends → 20480MB (250.0% of 8GB RAM)\n" +
+				"Worst case at max_connections 100: 204800MB (2500.0%) — only if every connection slot fills.",
 			DebugContains: []string{
 				"Instance: db.t4g.large (8GB RAM)",
-				"Worst-case RAM usage: 204800MB (2500.0% of available RAM)",
-				"Current active connections: 10 using ~20480MB (250.0%)",
-				"This configuration can cause out-of-memory errors when connections spike.",
+				"Observed backends: 10 using ~20480MB (250.0% of available RAM)",
+				"Worst case at max_connections 100: 204800MB (2500.0%) — shown for context, not graded",
+				"At the current backend count this can cause out-of-memory errors.",
 				"Note: Each query operation (sort/hash) can use work_mem multiple times.",
 			},
 		},
 		{
 			Name:      "maintenance_work_mem high budget (WARN)",
-			Setting:   "maintenance_work_mem",
-			Value:     "524288", // 512MB × 4 workers = 2048MB = 25% of 8GB
+			Overrides: map[string]string{"maintenance_work_mem": "524288"}, // 512MB × 4 workers = 2048MB = 25% of 8GB
 			FindingID: "maintenance_work_mem",
 			Severity:  check.SeverityWarn,
 			Details:   "maintenance_work_mem 512MB × autovacuum_max_workers 4 → total budget 2048MB (25.0% of 8GB RAM)",
@@ -287,8 +298,7 @@ func Test_VacuumSettings_RAMBudgetMessages(t *testing.T) {
 		},
 		{
 			Name:      "maintenance_work_mem dangerous budget (FAIL)",
-			Setting:   "maintenance_work_mem",
-			Value:     "1048576", // 1024MB × 4 workers = 4096MB = 50% of 8GB
+			Overrides: map[string]string{"maintenance_work_mem": "1048576"}, // 1024MB × 4 workers = 4096MB = 50% of 8GB
 			FindingID: "maintenance_work_mem",
 			Severity:  check.SeverityFail,
 			Details:   "maintenance_work_mem 1024MB × autovacuum_max_workers 4 → total budget 4096MB (50.0% of 8GB RAM)",
@@ -305,7 +315,7 @@ func Test_VacuumSettings_RAMBudgetMessages(t *testing.T) {
 		t.Run(tt.Name, func(t *testing.T) {
 			t.Parallel()
 
-			queryer := &mockVacuumSettingsQueries{rows: overrideOptimalWith(tt.Setting, tt.Value)}
+			queryer := &mockVacuumSettingsQueries{rows: overrideOptimalWithAll(tt.Overrides)}
 			checker := vacuumsettings.New(queryer)
 
 			ctx := check.ContextWithInstanceMetadata(context.Background(), mockMetadata())
@@ -319,6 +329,40 @@ func Test_VacuumSettings_RAMBudgetMessages(t *testing.T) {
 			for _, want := range tt.DebugContains {
 				require.Contains(t, finding.Debug, want)
 			}
+		})
+	}
+}
+
+func Test_VacuumSettings_WorkMemGuards(t *testing.T) {
+	t.Parallel()
+
+	missingBackendRow := optimalVacuumSettings()
+	delete(missingBackendRow, "active_connections")
+	missingBackendRow["work_mem"] = "2097152"
+
+	tests := []struct {
+		Name string
+		Rows []db.VacuumSettingsRow
+		Meta *check.InstanceMetadata
+	}{
+		{"backend count is zero", overrideOptimalWithAll(map[string]string{"work_mem": "2097152", "active_connections": "0"}), mockMetadata()},
+		{"backend count row missing", mapToVacuumSettingsRows(missingBackendRow), mockMetadata()},
+		{"instance memory unknown", overrideOptimalWith("work_mem", "2097152"), &check.InstanceMetadata{InstanceClass: "db.unknown", VCPUCores: 2, MemoryGB: 0}},
+		{"instance memory below one megabyte", overrideOptimalWith("work_mem", "2097152"), &check.InstanceMetadata{InstanceClass: "db.unknown", VCPUCores: 2, MemoryGB: 0.0005}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.Name, func(t *testing.T) {
+			t.Parallel()
+
+			queryer := &mockVacuumSettingsQueries{rows: tt.Rows}
+			checker := vacuumsettings.New(queryer)
+
+			ctx := check.ContextWithInstanceMetadata(context.Background(), tt.Meta)
+			report, err := checker.Check(ctx)
+			require.NoError(t, err)
+
+			require.Nil(t, findResult(report.Results, "work_mem"))
 		})
 	}
 }

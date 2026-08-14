@@ -22,7 +22,7 @@ var readme string
 const minWindowSeconds = 3600
 
 // TempUsageQueries defines the database queries needed by this check.
-// HasPgStatStatements is generated from partition-usage's query.sql: sqlc query
+// HasPgStatStatements is generated from query-stats-capacity's query.sql: sqlc query
 // names are global to the shared db package, so it is declared, not redefined.
 type TempUsageQueries interface {
 	TempUsage(context.Context) (db.TempUsageRow, error)
@@ -128,7 +128,7 @@ func (c *checker) reportTopStatements(ctx context.Context, report *check.Report,
 	}
 
 	if !available.Bool {
-		return "pg_stat_statements is not available, so nothing can be attributed.", nil
+		return "pg_stat_statements is unavailable or outdated, so nothing can be attributed.", nil
 	}
 
 	statements, err := c.queries.TempUsageByStatement(ctx)

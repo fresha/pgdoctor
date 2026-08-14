@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **check**: `InstanceMetadata` gains `IsReadReplica`, populated by the caller like every other field, so a check that is inapplicable on a physical read replica can scope itself instead of reporting a primary-only expectation as a failure ([#78](https://github.com/emancu/pgdoctor/issues/78)).
+- **`extension-versions`**: `pg_stat_statements` gains a version policy — WARN below 1.9, the floor `partition-usage`, `temp-usage` and `query-stats-capacity` read against ([#74](https://github.com/emancu/pgdoctor/issues/74)).
 
 ### Fixed
 
@@ -17,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **cli**: informational findings leave the per-check `(passed/total)` counter on both sides — they have nothing to pass or fail, so a healthy `cache-efficiency` read `(1/3)` ([#72](https://github.com/emancu/pgdoctor/pull/72)).
 - **`sequence-health`**: a database with no sequences now reports PASS instead of WARN — a UUID primary-key schema has nothing to check, which is not a defect ([#76](https://github.com/emancu/pgdoctor/issues/76)).
 - **`table-bloat`**: a database with quote-requiring table names reports bloat again instead of nothing at all. Sizes came from `pg_total_relation_size(schemaname || '.' || relname)`, whose text→`regclass` cast down-folds the identifier, so `public."Email"` was looked up as `public.email` and raised `42P01` — one such table lost the whole instance's results. Sizes now come from `relid` ([#75](https://github.com/emancu/pgdoctor/issues/75)).
+- **`partition-usage`, `temp-usage`, `query-stats-capacity`**: an instance running `pg_stat_statements` below 1.9 was reported as "not available" when the extension was installed and reading fine — `pg_stat_statements_info`, which the shared probe tests for, only exists from 1.9, and major-version upgrades do not run `ALTER EXTENSION ... UPDATE`. The checks now say "unavailable or outdated"; `extension-versions` reports which ([#73](https://github.com/emancu/pgdoctor/issues/73)).
 
 ## [0.4.0] - 2026-08-08
 

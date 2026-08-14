@@ -110,6 +110,28 @@ func TestExtensions(t *testing.T) {
 			severity: check.SeverityWarn,
 		},
 		{
+			name: "pg_stat_statements below the 1.9 floor",
+			data: []db.InstalledExtensionsRow{
+				{ExtensionName: "pg_stat_statements", InstalledVersion: "1.7"},
+			},
+			severity: check.SeverityWarn,
+		},
+		{
+			name: "pg_stat_statements at the floor",
+			data: []db.InstalledExtensionsRow{
+				{ExtensionName: "pg_stat_statements", InstalledVersion: "1.9"},
+			},
+			severity: check.SeverityPass,
+		},
+		{
+			// 1.11 sorts below 1.9 as a string; go-version orders it above.
+			name: "pg_stat_statements 1.11 is above the floor",
+			data: []db.InstalledExtensionsRow{
+				{ExtensionName: "pg_stat_statements", InstalledVersion: "1.11"},
+			},
+			severity: check.SeverityPass,
+		},
+		{
 			name: "extension with no policy",
 			data: []db.InstalledExtensionsRow{
 				{ExtensionName: "plpgsql", InstalledVersion: "1.0"},
@@ -169,6 +191,22 @@ func TestExtensionsMixedSetReportsMaxSeverity(t *testing.T) {
 
 	// Failing rows must sort ahead of OK rows.
 	require.Equal(t, "pg_partman", finding.Table.Rows[0].Cells[0])
+}
+
+func TestPgStatStatementsRequiredCell(t *testing.T) {
+	t.Parallel()
+
+	queries := &mockQueries{data: []db.InstalledExtensionsRow{
+		{ExtensionName: "pg_stat_statements", InstalledVersion: "1.7"},
+	}}
+
+	report, err := New(queries).Check(context.Background())
+	require.NoError(t, err)
+	checktest.AssertSeverityInvariant(t, report)
+
+	finding := findingByID(t, report, "version-support")
+	require.NotNil(t, finding.Table)
+	require.Equal(t, []string{"pg_stat_statements", "1.7", "≥ 1.9"}, finding.Table.Rows[0].Cells)
 }
 
 func TestSupportFindingTableOnlyFlaggedRows(t *testing.T) {

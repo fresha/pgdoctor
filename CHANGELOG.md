@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **cli**: the summary's `N info` tally counts again. It switched on report severity, which a `SeverityInfo` finding never raises above PASS, so the branch was unreachable and information-only checks were tallied as passing ([#72](https://github.com/emancu/pgdoctor/pull/72)).
 - **cli**: informational findings leave the per-check `(passed/total)` counter on both sides — they have nothing to pass or fail, so a healthy `cache-efficiency` read `(1/3)` ([#72](https://github.com/emancu/pgdoctor/pull/72)).
 - **`sequence-health`**: a database with no sequences now reports PASS instead of WARN — a UUID primary-key schema has nothing to check, which is not a defect ([#76](https://github.com/emancu/pgdoctor/issues/76)).
+- **`table-bloat`**: a database with quote-requiring table names reports bloat again instead of nothing at all. Sizes came from `pg_total_relation_size(schemaname || '.' || relname)`, whose text→`regclass` cast down-folds the identifier, so `public."Email"` was looked up as `public.email` and raised `42P01` — one such table lost the whole instance's results. Sizes now come from `relid` ([#75](https://github.com/emancu/pgdoctor/issues/75)).
 
 ## [0.4.0] - 2026-08-08
 

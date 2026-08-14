@@ -112,10 +112,9 @@ Validates memory allocated for query operations (sorts, hash tables).
 
 **Severity:**
 - FAIL: Value < 4MB (critically low, causes excessive temp file usage)
-- FAIL: Worst-case usage (work_mem × max_connections) > 80% of RAM
-- WARN: Worst-case usage > 50% of RAM
-- WARN: Current usage (work_mem × active_connections) > 40% of RAM
-- OK: Reasonable value with safe worst-case usage
+- FAIL: work_mem × connected backends > 80% of RAM
+- WARN: work_mem × connected backends > 50% of RAM
+- OK: Reasonable value at the observed backend count
 
 **PostgreSQL default:** 4MB
 
@@ -123,7 +122,9 @@ Validates memory allocated for query operations (sorts, hash tables).
 
 **Why this matters:** Each query operation (sort, hash) can use work_mem, and complex queries use it multiple times. Too low causes disk I/O from temp files. Too high risks out-of-memory errors.
 
-**HIGH RISK:** `Worst-case = work_mem × max_connections` can spike during connection surges.
+**HIGH RISK:** Memory pressure scales with the backends actually connected. `work_mem × max_connections` is reported as context only — behind a connection pooler the pool size, not `max_connections`, caps server-side backends.
+
+**Note:** The backend count is a single sample taken when the check runs. A scan during a quiet window under-reports real usage.
 
 ## Why It Matters
 
@@ -189,10 +190,10 @@ Check PostgreSQL logs for autovacuum messages:
 
 | Parameter | Used By | Multiplier | Risk Factor |
 |-----------|---------|------------|-------------|
-| `work_mem` | Query sorts/hashes | `max_connections` | **High** (can OOM easily) |
+| `work_mem` | Query sorts/hashes | connected backends | **High** (can OOM easily) |
 | `maintenance_work_mem` | VACUUM, CREATE INDEX | `autovacuum_max_workers` | **Medium** (fewer workers) |
 
-**Key difference**: `work_mem` can multiply by 100+ connections, `maintenance_work_mem` typically by 3-6 workers.
+**Key difference**: `work_mem` multiplies by the backends actually connected, `maintenance_work_mem` by 3-6 workers. Behind a connection pooler the pool size sets that ceiling, well below `max_connections`.
 
 ## How to Fix
 
@@ -259,9 +260,10 @@ SELECT pg_reload_conf();
 ### For `work_mem`
 
 **PostgreSQL default: `4MB`**
-- **HIGH RISK**: Multiplies by `max_connections`
-- Total `worst-case = work_mem × max_connections`
-- Keep `worst-case` under 50-80% of available RAM
+- **HIGH RISK**: Multiplies by the number of connected backends
+- Keep `work_mem × connected backends` under 50% of available RAM
+- Behind a connection pooler, the pool size caps backends well below `max_connections`
+- `work_mem` is reload-only; changing `max_connections` requires a restart
 - Values < 4MB cause excessive temp file usage
 - Values > 64MB risky without RAM awareness
 

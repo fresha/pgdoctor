@@ -21,6 +21,10 @@ Running outdated extensions carries real operational risk:
   declarative partitioning, dropping the old trigger-based child-table machinery. The 4.x line no
   longer receives fixes, and partition maintenance behaviour differs enough that staying on 4.x is a
   liability.
+- **Stale `pg_stat_statements` blinds three checks**: below 1.9 there is no `pg_stat_statements_info`
+  view and no `toplevel` column, so `partition-usage`, `temp-usage` and `query-stats-capacity` cannot
+  read what they need. RDS and Aurora major-version upgrades install the newer extension files but
+  never run `ALTER EXTENSION ... UPDATE`, so an instance can sit at 1.7 long after the engine moved on.
 - **Pre-5.1.0 breaks CDC on new partitions**: below 5.1.0, `run_maintenance()` doesn't inherit
   `REPLICA IDENTITY` onto new child partitions, so `FULL` (or unique-index) identity silently
   reverts to `DEFAULT` — dropping before-images from logical replication ([pg_partman
@@ -47,6 +51,8 @@ The seeded policies are:
   missing — see "Why This Matters" above.
 - `postgis` — warn below `3.3`, fail below `3.0`. Releases below 3.3 are EOL upstream (deprecated);
   2.x (below 3.0) is unsupported.
+- `pg_stat_statements` — warn below `1.9`, no fail floor. 1.9 is where `pg_stat_statements_info` and
+  the `toplevel` column arrive, which `partition-usage`, `temp-usage` and `query-stats-capacity` read.
 
 Only extensions that need attention appear in the table; a clean run is just the PASS line. The
 finding summary reports how many extensions are installed.

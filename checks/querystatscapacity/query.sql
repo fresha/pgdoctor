@@ -1,3 +1,12 @@
+-- name: HasPgStatStatements :one
+-- Checks if pg_stat_statements can be read. Installed is not enough: it can be
+-- created without the library preloaded, or into a schema outside search_path, and
+-- then every read errors. The GUC only exists when the library loaded.
+SELECT
+  EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements')
+  AND EXISTS(SELECT 1 FROM pg_settings WHERE name = 'pg_stat_statements.max')
+  AND to_regclass('pg_stat_statements_info') IS NOT NULL;
+
 -- name: QueryStatsCapacity :one
 -- entries and pg_stat_statements.max are cluster-wide, so neither is filtered by
 -- database. pg_stat_statements(false) skips the query-text file, which is what

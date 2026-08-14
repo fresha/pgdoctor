@@ -19,6 +19,9 @@ var querySQL string
 //go:embed README.md
 var readme string
 
+// PartitionUsageQueries defines the database queries needed by this check.
+// HasPgStatStatements is generated from query-stats-capacity's query.sql: sqlc query
+// names are global to the shared db package, so it is declared, not redefined.
 type PartitionUsageQueries interface {
 	HasPgStatStatements(context.Context) (pgtype.Bool, error)
 	HiddenQueryTextCount(context.Context) (pgtype.Int8, error)
@@ -101,9 +104,9 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 	if !hasExtension.Bool {
 		report.AddFinding(check.Finding{
 			ID:       "extension-unavailable",
-			Name:     "pg_stat_statements Extension Not Available",
+			Name:     "pg_stat_statements Unavailable or Outdated",
 			Severity: check.SeverityWarn,
-			Details:  fmt.Sprintf("Found %d partitioned table(s) but cannot analyze query patterns without pg_stat_statements extension", len(partitionedTables)),
+			Details:  fmt.Sprintf("Found %d partitioned table(s) but cannot analyze query patterns: pg_stat_statements is unavailable or outdated", len(partitionedTables)),
 		})
 
 		return report, nil

@@ -16,7 +16,7 @@ SELECT
       THEN ROUND((n_dead_tup::numeric / (n_live_tup + n_dead_tup)::numeric) * 100, 2)
     ELSE 0
   END AS dead_tuple_percent
-  , PG_TOTAL_RELATION_SIZE(schemaname || '.' || relname) AS total_size_bytes
+  , pg_total_relation_size(relid) AS total_size_bytes
 FROM pg_stat_user_tables
 WHERE
   schemaname NOT IN ('pg_catalog', 'information_schema')

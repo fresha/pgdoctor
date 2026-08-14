@@ -23,6 +23,11 @@ var ExtensionPolicies = []ExtensionPolicy{
 		FailBelow: "3.0",
 		Reason:    "PostGIS < 3.3 is EOL upstream (deprecated); < 3.0 (2.x) is unsupported.",
 	},
+	{
+		Name:      "pg_stat_statements",
+		WarnBelow: "1.9",
+		Reason:    "Below 1.9 there is no pg_stat_statements_info and no toplevel column, needed by other checks.",
+	},
 }
 
 // requiredVersion is the version to upgrade to: WarnBelow if set, else FailBelow.

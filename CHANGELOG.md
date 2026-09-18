@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-09-18
+
+### Changed
+
+- **`table-vacuum-health`**: `autovacuum-disabled` reports one table row per table (Table, Rows, Size, Dead Tuples, Last Vacuum, worst first by dead tuples) instead of a comma-joined sentence in `Details`, matching its sibling subchecks. A consumer can now act on or suppress a single table; `Details` carries only the count.
+
 ## [0.9.0] - 2026-08-14
 
 Tracks upstream [emancu/pgdoctor v0.5.0](https://github.com/emancu/pgdoctor/releases/tag/v0.5.0): read-replica awareness in `InstanceMetadata`, a `pg_stat_statements` version policy, and four check fixes — most notably `work_mem`, which no longer fails pooled instances on a `max_connections` ceiling they never approach.

@@ -2,7 +2,7 @@
 
 Analyzes database-wide buffer cache hit ratio to identify memory pressure and I/O bottlenecks.
 
-> **Note**: This check depends on PostgreSQL runtime statistics. For accurate results, statistics should be at least 7 days old. Run the `statistics-freshness` check to validate statistics maturity.
+> **Note**: This check depends on PostgreSQL runtime statistics. For accurate results, statistics should be at least 7 days old. Run the `db-statistics` check to validate statistics maturity.
 
 ## What It Checks
 
@@ -25,8 +25,6 @@ Lists an index only when it is a hot, disk-bound index — all of the following 
 
 A rarely-read index is uncached by design, so only hot-path indexes are reported.
 
-**Severity**: INFO
-
 ### Per-Table Cache Hit Ratio (`table-cache-ratio`)
 
 Lists a table only when it is a hot, disk-bound heap — all of the following hold:
@@ -35,8 +33,6 @@ Lists a table only when it is a hot, disk-bound heap — all of the following ho
 - heap cache hit ratio (`heap_blks_hit` / (`heap_blks_hit` + `heap_blks_read`)) < 75%
 
 Index blocks are covered by the sibling `index-cache-ratio` finding; TOAST blocks are excluded.
-
-**Severity**: INFO
 
 ## Why Cache Hit Ratio Matters
 
@@ -64,7 +60,7 @@ Index blocks are covered by the sibling `index-cache-ratio` finding; TOAST block
 
 ## Statistics Requirements
 
-This check requires at least **7 days** of statistics history. Recent statistics resets will trigger a warning.
+This check requires at least **7 days** of statistics history. After a recent statistics reset, the ratios do not represent the workload.
 
 ## How to Fix
 
@@ -175,3 +171,6 @@ read, and scan counters, ranking each index by scan count and computing its shar
 of total index-scan traffic to identify hot indexes. The per-table query mirrors
 this over `pg_statio_user_tables` and `pg_stat_user_tables`, ranking by heap reads
 (`seq_scan` + `idx_scan`) and measuring the heap-block hit ratio.
+The per-index and per-table queries read every non-system schema, not only
+`public`, and exclude temporary tables and their indexes. Each row names its
+object as `schema.name`.

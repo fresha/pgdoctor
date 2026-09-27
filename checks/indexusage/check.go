@@ -44,7 +44,7 @@ func Metadata() check.Metadata {
 	}
 }
 
-func New(queries IndexUsageQueries, _ ...check.Config) check.Checker {
+func New(queries IndexUsageQueries) check.Checker {
 	return &checker{
 		queries: queries,
 	}
@@ -73,7 +73,7 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 
 	// Every row carries the same database-wide values, so the first one answers for the set.
 	checkUnusedIndexes(rows, rows[0].StatsReset, report)
-	checkLowUsageIndexes(rows, rows[0].StatsAgeSeconds, report)
+	checkLowUsageIndexes(rows, rows[0].StatsReset, rows[0].StatsAgeSeconds, report)
 
 	return report, nil
 }
@@ -119,7 +119,7 @@ func checkUnusedIndexes(rows []db.IndexUsageStatsRow, statsReset pgtype.Timestam
 		ID:       "unused-indexes",
 		Name:     "Unused Indexes",
 		Severity: check.SeverityWarn,
-		Details:  fmt.Sprintf("Found %d unused indexes (0 scans%s, >500MB)", len(unused), since),
+		Details:  fmt.Sprintf("Found %d unused indexes (0 scans%s, >500MiB).\nScan counts cover this instance only. Before you drop an index, confirm 0 scans on the primary and on every replica.", len(unused), since),
 		Table: &check.Table{
 			Headers: []string{"Table", "Index", "Size"},
 			Rows:    tableRows,
@@ -127,17 +127,20 @@ func checkUnusedIndexes(rows []db.IndexUsageStatsRow, statsReset pgtype.Timestam
 	})
 }
 
-func checkLowUsageIndexes(rows []db.IndexUsageStatsRow, statsAgeSeconds pgtype.Int8, report *check.Report) {
-	windowKnown := statsAgeSeconds.Valid
-	windowDays := 0
-	if windowKnown {
-		windowDays = int(statsAgeSeconds.Int64 / secondsPerDay)
-	}
+func checkLowUsageIndexes(rows []db.IndexUsageStatsRow, statsReset pgtype.Timestamptz, statsAgeSeconds pgtype.Int8, report *check.Report) {
+	windowDays := int(statsAgeSeconds.Int64 / secondsPerDay)
 
-	// A NULL stats_reset means counters run since creation: an old window that
-	// trivially clears the age gate and the read-rate gate.
-	if windowKnown && windowDays < lowUsageMinWindowDays {
-		reportLowUsage(nil, report)
+	if windowDays < lowUsageMinWindowDays {
+		details := fmt.Sprintf("Statistics cover %d days, and a read rate needs at least %d days", windowDays, lowUsageMinWindowDays)
+		if !statsReset.Valid {
+			details = fmt.Sprintf("No statistics reset is recorded, and the server uptime of %d days is shorter than the %d days a read rate needs", windowDays, lowUsageMinWindowDays)
+		}
+		report.AddFinding(check.Finding{
+			ID:       "low-usage-indexes",
+			Name:     "Low Usage Indexes",
+			Severity: check.SeveritySkip,
+			Details:  details,
+		})
 		return
 	}
 
@@ -156,7 +159,7 @@ func checkLowUsageIndexes(rows []db.IndexUsageStatsRow, statsAgeSeconds pgtype.I
 		if row.IndexSizeBytes.Int64 < lowUsageSizeFloorBytes {
 			continue
 		}
-		if windowKnown && row.IdxScan.Int64*7 >= int64(windowDays) {
+		if row.IdxScan.Int64*7 >= int64(windowDays) {
 			continue
 		}
 		lowUsage = append(lowUsage, row)
@@ -193,7 +196,7 @@ func reportLowUsage(lowUsage []db.IndexUsageStatsRow, report *check.Report) {
 		ID:       "low-usage-indexes",
 		Name:     "Low Usage Indexes",
 		Severity: check.SeverityInfo,
-		Details:  fmt.Sprintf("Found %d indexes with sustained low read rates (>500MB, >=10k writes, <1 scan/week)", len(lowUsage)),
+		Details:  fmt.Sprintf("Found %d indexes with sustained low read rates (>500MiB, >=10k writes, <1 scan/week)", len(lowUsage)),
 		Table: &check.Table{
 			Headers: []string{"Table", "Index", "Size", "Scans", "Writes"},
 			Rows:    tableRows,

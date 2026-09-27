@@ -20,9 +20,40 @@ type SequenceHealthQueries interface {
 	SequenceHealth(context.Context) ([]db.SequenceHealthRow, error)
 }
 
-type checker struct {
-	queries SequenceHealthQueries
+type Config struct {
+	UsageWarnPercent float64 `yaml:"usage_warn_percent"`
+	UsageFailPercent float64 `yaml:"usage_fail_percent"`
 }
+
+func DefaultConfig() Config {
+	return Config{UsageWarnPercent: 50, UsageFailPercent: 90}
+}
+
+func (c Config) Validate() error {
+	if !(c.UsageWarnPercent > 0 && c.UsageWarnPercent <= 100) {
+		return fmt.Errorf("usage_warn_percent: %v is not a percent in (0, 100]", c.UsageWarnPercent)
+	}
+	if !(c.UsageFailPercent > 0 && c.UsageFailPercent <= 100) {
+		return fmt.Errorf("usage_fail_percent: %v is not a percent in (0, 100]", c.UsageFailPercent)
+	}
+	if c.UsageWarnPercent >= c.UsageFailPercent {
+		return fmt.Errorf("usage_warn_percent %v must be lower than usage_fail_percent %v", c.UsageWarnPercent, c.UsageFailPercent)
+	}
+	return nil
+}
+
+type checker struct {
+	queries          SequenceHealthQueries
+	usageWarnPercent float64
+	usageFailPercent float64
+}
+
+const (
+	unreadableReason = "role cannot read sequence values (needs SELECT on the sequences)"
+
+	bigintUsageWarnPercent = 75.0
+	bigintUsageFailPercent = 90.0
+)
 
 func Metadata() check.Metadata {
 	return check.Metadata{
@@ -35,9 +66,11 @@ func Metadata() check.Metadata {
 	}
 }
 
-func New(queries SequenceHealthQueries, _ ...check.Config) check.Checker {
+func New(queries SequenceHealthQueries, cfg Config) check.Checker {
 	return &checker{
-		queries: queries,
+		queries:          queries,
+		usageWarnPercent: cfg.UsageWarnPercent,
+		usageFailPercent: cfg.UsageFailPercent,
 	}
 }
 
@@ -62,9 +95,36 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 		return report, nil
 	}
 
-	checkNearExhaustion(rows, report)
-	checkIntegerShouldBeBigint(rows, report)
-	checkSequenceTypeMismatch(rows, report)
+	var readable []db.SequenceHealthRow
+	for _, row := range rows {
+		if !row.IsUnreadable.Bool {
+			readable = append(readable, row)
+		}
+	}
+
+	if len(readable) == 0 {
+		report.AddFinding(check.Finding{
+			ID:       report.CheckID,
+			Name:     report.Name,
+			Severity: check.SeveritySkip,
+			Details:  unreadableReason,
+		})
+		report.Severity = check.SeveritySkip
+		return report, nil
+	}
+
+	checkNearExhaustion(readable, c.usageWarnPercent, c.usageFailPercent, report)
+	checkIntegerShouldBeBigint(readable, c.usageWarnPercent, c.usageFailPercent, report)
+	checkSequenceTypeMismatch(rows, c.usageWarnPercent, c.usageFailPercent, report)
+
+	if unreadable := len(rows) - len(readable); unreadable > 0 {
+		report.AddFinding(check.Finding{
+			ID:       "unreadable-sequences",
+			Name:     "Unreadable Sequences",
+			Severity: check.SeverityInfo,
+			Details:  fmt.Sprintf("%d sequence(s) not evaluated: %s", unreadable, unreadableReason),
+		})
+	}
 
 	return report, nil
 }
@@ -77,18 +137,37 @@ func getUsagePercent(row db.SequenceHealthRow) float64 {
 	return f.Float64
 }
 
-func checkNearExhaustion(rows []db.SequenceHealthRow, report *check.Report) {
-	var critical []db.SequenceHealthRow // >90%
-	var warning []db.SequenceHealthRow  // >75%
+func getColumnUsagePercent(row db.SequenceHealthRow) float64 {
+	f, _ := row.ColumnUsagePercent.Float64Value()
+	return f.Float64
+}
+
+func usageSeverity(usage, warnPercent, failPercent float64) check.Severity {
+	switch {
+	case usage >= failPercent:
+		return check.SeverityFail
+	case usage >= warnPercent:
+		return check.SeverityWarn
+	}
+	return check.SeverityInfo
+}
+
+func checkNearExhaustion(rows []db.SequenceHealthRow, usageWarnPercent, usageFailPercent float64, report *check.Report) {
+	var critical []db.SequenceHealthRow
+	var warning []db.SequenceHealthRow
 
 	for _, row := range rows {
-		usage := getUsagePercent(row)
 		if row.IsCyclic.Bool {
 			continue // Cyclic sequences wrap around safely
 		}
-		if usage >= 90 {
+		warnPercent, failPercent := usageWarnPercent, usageFailPercent
+		if row.SeqDataType.String == "bigint" {
+			warnPercent, failPercent = bigintUsageWarnPercent, bigintUsageFailPercent
+		}
+		switch usageSeverity(getUsagePercent(row), warnPercent, failPercent) {
+		case check.SeverityFail:
 			critical = append(critical, row)
-		} else if usage >= 75 {
+		case check.SeverityWarn:
 			warning = append(warning, row)
 		}
 	}
@@ -98,7 +177,7 @@ func checkNearExhaustion(rows []db.SequenceHealthRow, report *check.Report) {
 			ID:       "near-exhaustion",
 			Name:     "Sequence Exhaustion",
 			Severity: check.SeverityPass,
-			Details:  "All sequences have sufficient headroom (<75% used)",
+			Details:  "All sequences have sufficient headroom",
 		})
 		return
 	}
@@ -136,7 +215,7 @@ func checkNearExhaustion(rows []db.SequenceHealthRow, report *check.Report) {
 	details := fmt.Sprintf("Found %d sequence(s) nearing exhaustion", len(critical)+len(warning))
 	if len(critical) > 0 {
 		severity = check.SeverityFail
-		details = fmt.Sprintf("CRITICAL: %d sequence(s) at >90%% capacity! %d more at >75%%", len(critical), len(warning))
+		details = fmt.Sprintf("CRITICAL: %d sequence(s) near exhaustion! %d more nearing it", len(critical), len(warning))
 	}
 
 	report.AddFinding(check.Finding{
@@ -151,11 +230,11 @@ func checkNearExhaustion(rows []db.SequenceHealthRow, report *check.Report) {
 	})
 }
 
-func checkIntegerShouldBeBigint(rows []db.SequenceHealthRow, report *check.Report) {
+func checkIntegerShouldBeBigint(rows []db.SequenceHealthRow, usageWarnPercent, usageFailPercent float64, report *check.Report) {
 	var needsMigration []db.SequenceHealthRow
 
 	for _, row := range rows {
-		if row.ShouldBeBigint.Bool {
+		if row.ColumnUsagePercent.Valid && getColumnUsagePercent(row) >= usageWarnPercent {
 			needsMigration = append(needsMigration, row)
 		}
 	}
@@ -165,22 +244,19 @@ func checkIntegerShouldBeBigint(rows []db.SequenceHealthRow, report *check.Repor
 			ID:       "integer-columns",
 			Name:     "Integer Column Safety",
 			Severity: check.SeverityPass,
-			Details:  "No integer columns with high sequence usage detected",
+			Details:  "No integer columns near their type limit",
 		})
 		return
 	}
 
-	headers := []string{"Table", "Column", "Type", "Usage", "Current Value"}
+	headers := []string{"Table", "Column", "Type", "Usage", "Current Value", "FKs"}
 	var tableRows []check.TableRow
 	severity := check.SeverityWarn
 
 	for _, row := range needsMigration {
-		usage := getUsagePercent(row)
-		rowSeverity := check.SeverityWarn
-		if usage >= 75 {
-			rowSeverity = check.SeverityFail
-			severity = check.SeverityFail
-		}
+		usage := getColumnUsagePercent(row)
+		rowSeverity := usageSeverity(usage, usageWarnPercent, usageFailPercent)
+		severity = max(severity, rowSeverity)
 
 		tableRows = append(tableRows, check.TableRow{
 			Cells: []string{
@@ -189,6 +265,7 @@ func checkIntegerShouldBeBigint(rows []db.SequenceHealthRow, report *check.Repor
 				row.ColumnType.String,
 				fmt.Sprintf("%.1f%%", usage),
 				check.FormatNumber(row.CurrentValue.Int64),
+				check.FormatNumber(row.FkReferenceCount.Int64),
 			},
 			Severity: rowSeverity,
 		})
@@ -198,7 +275,7 @@ func checkIntegerShouldBeBigint(rows []db.SequenceHealthRow, report *check.Repor
 		ID:       "integer-columns",
 		Name:     "Integer Column Safety",
 		Severity: severity,
-		Details:  fmt.Sprintf("Found %d integer column(s) with >50%% sequence usage that should be migrated to bigint", len(needsMigration)),
+		Details:  fmt.Sprintf("Found %d integer column(s) at >=%g%% of their type limit that should be migrated to bigint", len(needsMigration), usageWarnPercent),
 		Table: &check.Table{
 			Headers: headers,
 			Rows:    tableRows,
@@ -206,11 +283,11 @@ func checkIntegerShouldBeBigint(rows []db.SequenceHealthRow, report *check.Repor
 	})
 }
 
-func checkSequenceTypeMismatch(rows []db.SequenceHealthRow, report *check.Report) {
+func checkSequenceTypeMismatch(rows []db.SequenceHealthRow, usageWarnPercent, usageFailPercent float64, report *check.Report) {
 	var mismatched []db.SequenceHealthRow
 
 	for _, row := range rows {
-		if row.SequenceExceedsColumn.Bool && row.ColumnType.String != "" {
+		if exceedsColumn(row) {
 			mismatched = append(mismatched, row)
 		}
 	}
@@ -225,19 +302,30 @@ func checkSequenceTypeMismatch(rows []db.SequenceHealthRow, report *check.Report
 		return
 	}
 
-	headers := []string{"Sequence", "Table.Column", "Column Type", "Seq Max", "Column Max"}
+	headers := []string{"Sequence", "Table.Column", "Column Type", "Seq Min", "Seq Max", "Column Max", "Column Usage"}
 	var tableRows []check.TableRow
+	severity := check.SeverityInfo
 
 	for _, row := range mismatched {
+		rowSeverity := check.SeverityInfo
+		usage := "-"
+		if row.ColumnUsagePercent.Valid {
+			rowSeverity = usageSeverity(getColumnUsagePercent(row), usageWarnPercent, usageFailPercent)
+			usage = fmt.Sprintf("%.1f%%", getColumnUsagePercent(row))
+		}
+		severity = max(severity, rowSeverity)
+
 		tableRows = append(tableRows, check.TableRow{
 			Cells: []string{
 				row.SequenceName.String,
 				formatTableColumn(row.TableName.String, row.ColumnName.String),
 				row.ColumnType.String,
+				check.FormatNumber(row.MinValue.Int64),
 				check.FormatNumber(row.MaxValue.Int64),
 				check.FormatNumber(row.ColumnMaxValue.Int64),
+				usage,
 			},
-			Severity: check.SeverityFail,
+			Severity: rowSeverity,
 		})
 	}
 
@@ -246,7 +334,7 @@ func checkSequenceTypeMismatch(rows []db.SequenceHealthRow, report *check.Report
 	report.AddFinding(check.Finding{
 		ID:       "type-mismatch",
 		Name:     "Sequence Type Mismatch",
-		Severity: check.SeverityFail,
+		Severity: severity,
 		Details:  details,
 		Table: &check.Table{
 			Headers: headers,
@@ -256,6 +344,10 @@ func checkSequenceTypeMismatch(rows []db.SequenceHealthRow, report *check.Report
 }
 
 // Helper functions
+
+func exceedsColumn(row db.SequenceHealthRow) bool {
+	return row.SequenceExceedsColumn.Bool && row.ColumnType.String != ""
+}
 
 func formatTableColumn(table, column string) string {
 	if table == "" || column == "" {

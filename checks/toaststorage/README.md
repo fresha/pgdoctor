@@ -101,11 +101,13 @@ PostgreSQL offers four storage strategies that control how large values are hand
 
 ## Subchecks
 
+### toast-usage
+
+Looks for tables with more than 1MB of TOAST storage.
+
 ### toast-ratio
 
 Lists TOAST-heavy tables: TOAST >=50% of total size, or >=10GB absolute. Sorted by TOAST size.
-
-**Severity**: INFO
 
 ### toast-bloat
 
@@ -127,13 +129,9 @@ A column with no explicit `SET COMPRESSION` follows `default_toast_compression` 
 columns on an lz4-default instance already write lz4 and are not counted. `EXTERNAL`/`PLAIN` storage never
 compresses and is never counted.
 
-**Severity**: INFO
-
 ### compression-default
 
-Checks the cluster-wide `default_toast_compression` setting (PostgreSQL 14+).
-
-**Severity**: WARN when not lz4
+Checks the cluster-wide `default_toast_compression` setting (PostgreSQL 14+), and flags any value other than `lz4`.
 
 ## How to Fix
 

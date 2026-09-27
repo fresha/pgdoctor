@@ -42,7 +42,7 @@ func Metadata() check.Metadata {
 	}
 }
 
-func New(queryer ReplicationSlotsQueries, _ ...check.Config) check.Checker {
+func New(queryer ReplicationSlotsQueries) check.Checker {
 	return &checker{queryer: queryer}
 }
 
@@ -85,7 +85,6 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 
 		if !slot.Active.Bool {
 			inactiveSlots = append(inactiveSlots, slot)
-			continue
 		}
 
 		if slot.RestartLsnLagBytes.Valid {
@@ -233,7 +232,7 @@ func reportCriticalLagSlots(report *check.Report, slots []db.ReplicationSlotsRow
 		ID:       "critical-lag",
 		Name:     "Critical Replication Lag",
 		Severity: check.SeverityFail,
-		Details:  fmt.Sprintf("Found %d slot(s) with critical lag (>= 5GB):\n%s\n\nConsumers are severely behind and may never catch up.", len(slots), strings.Join(lines, "\n")),
+		Details:  fmt.Sprintf("Found %d slot(s) with critical lag (>= 5GiB):\n%s\n\nConsumers are severely behind and may never catch up.", len(slots), strings.Join(lines, "\n")),
 	})
 }
 
@@ -251,6 +250,6 @@ func reportHighLagSlots(report *check.Report, slots []db.ReplicationSlotsRow) {
 		ID:       "high-lag",
 		Name:     "High Replication Lag",
 		Severity: check.SeverityWarn,
-		Details:  fmt.Sprintf("Found %d slot(s) with high lag (>= 1GB):\n%s\n\nConsumers are falling behind.", len(slots), strings.Join(lines, "\n")),
+		Details:  fmt.Sprintf("Found %d slot(s) with high lag (>= 1GiB):\n%s\n\nConsumers are falling behind.", len(slots), strings.Join(lines, "\n")),
 	})
 }

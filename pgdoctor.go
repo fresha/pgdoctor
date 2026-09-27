@@ -3,14 +3,18 @@
 package pgdoctor
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"strings"
 	"time"
 
 	"github.com/fresha/pgdoctor/check"
 	"github.com/fresha/pgdoctor/db"
 	"github.com/jackc/pgx/v5/pgconn"
+	"go.yaml.in/yaml/v3"
 )
 
 // DefaultStatementTimeoutMs is the PostgreSQL statement_timeout in milliseconds.
@@ -33,6 +37,8 @@ type Options struct {
 }
 
 // Run executes checks sequentially against the given connection.
+// A check that fails, or whose entry in Options.Config is invalid, reports SKIP
+// with the reason.
 //
 // Important: callers should SET statement_timeout on the connection before calling Run()
 // to prevent slow queries from blocking the database. See DefaultStatementTimeoutMs.
@@ -42,16 +48,19 @@ func Run(ctx context.Context, conn db.DBTX, opts Options) {
 		onReport = func(*check.Report) {}
 	}
 
-	for _, pkg := range opts.Checks {
-		checker := pkg.New(conn, opts.Config)
+	ctx = withServerVersion(ctx, conn)
 
+	for _, pkg := range opts.Checks {
 		start := time.Now()
-		report, err := checker.Check(ctx)
+		checker, err := pkg.New(conn, opts.Config)
+		var report *check.Report
+		if err == nil {
+			report, err = checker.Check(ctx)
+		}
 		elapsed := time.Since(start)
 
 		if err != nil {
-			metadata := checker.Metadata()
-			report = check.NewReport(metadata)
+			report = check.NewReport(pkg.Metadata())
 			report.Severity = check.SeveritySkip
 
 			detail := err.Error()
@@ -70,6 +79,41 @@ func Run(ctx context.Context, conn db.DBTX, opts Options) {
 		report.Duration = elapsed
 		onReport(report)
 	}
+}
+
+// decodeConfig decodes YAML settings over dst and rejects a key that dst does
+// not declare, at any depth. Empty or null settings leave dst unchanged.
+func decodeConfig(data []byte, dst any) error {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(dst); err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	return nil
+}
+
+// withServerVersion fills the engine version from the server when the
+// caller's instance metadata does not carry one.
+func withServerVersion(ctx context.Context, conn db.DBTX) context.Context {
+	meta := check.InstanceMetadataFromContext(ctx)
+	if meta != nil && meta.EngineVersionMajor != 0 {
+		return ctx
+	}
+
+	version, err := db.New(conn).PGVersion(ctx)
+	if err != nil {
+		return ctx
+	}
+
+	var filled check.InstanceMetadata
+	if meta != nil {
+		filled = *meta
+	}
+	filled.EngineVersionMajor = int(version.Major)
+	filled.EngineVersionMinor = int(version.Minor)
+	filled.EngineVersion = fmt.Sprintf("%d.%d", filled.EngineVersionMajor, filled.EngineVersionMinor)
+
+	return check.ContextWithInstanceMetadata(ctx, &filled)
 }
 
 // Filter returns checks matching the only/ignored filters.
@@ -124,16 +168,17 @@ func toSet(items []string) map[string]struct{} {
 //   - "check-id" -> "check-id" (exact match)
 //   - "check-id/subcheck-id" -> "check-id" (extracts check ID from subcheck)
 //   - "category" -> "category" (exact match)
+//   - "category/check-id[/subcheck-id]" -> "check-id" (the form `pgdoctor list` prints)
 //
 // Invalid filters are those that don't match any check ID or category.
 func ValidateFilters(checks []check.Package, filters []string) (valid, invalid []string) {
 	// Build set of valid check IDs and categories
-	validCheckIDs := map[string]struct{}{}
+	checkCategories := map[string]string{}
 	validCategories := map[string]struct{}{}
 
 	for _, pkg := range checks {
 		metadata := pkg.Metadata()
-		validCheckIDs[metadata.CheckID] = struct{}{}
+		checkCategories[metadata.CheckID] = string(metadata.Category)
 		validCategories[string(metadata.Category)] = struct{}{}
 	}
 
@@ -142,14 +187,18 @@ func ValidateFilters(checks []check.Package, filters []string) (valid, invalid [
 
 	for _, filter := range filters {
 		// Normalize: extract check ID from subcheck format (check-id/subcheck-id)
-		normalized := filter
-		if strings.Contains(filter, "/") {
-			parts := strings.SplitN(filter, "/", 2)
-			normalized = parts[0]
+		parts := strings.Split(filter, "/")
+		normalized := parts[0]
+		if _, isCategory := validCategories[parts[0]]; isCategory && len(parts) > 1 {
+			normalized = parts[1]
+			if checkCategories[normalized] != parts[0] {
+				invalid = append(invalid, filter)
+				continue
+			}
 		}
 
 		// Check if normalized filter is valid (check ID or category)
-		if _, isCheckID := validCheckIDs[normalized]; isCheckID {
+		if _, isCheckID := checkCategories[normalized]; isCheckID {
 			if _, alreadySeen := seen[normalized]; !alreadySeen {
 				valid = append(valid, normalized)
 				seen[normalized] = struct{}{}

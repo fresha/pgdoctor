@@ -2,7 +2,7 @@
 
 Analyzes index usage patterns to identify unused and inefficient indexes that waste disk space and slow down write operations.
 
-> **Note**: This check depends on PostgreSQL runtime statistics. For accurate results, statistics should be at least 7 days old. Run the `statistics-freshness` check to validate statistics maturity.
+> **Note**: This check depends on PostgreSQL runtime statistics. For accurate results, statistics should be at least 7 days old. Run the `db-statistics` check to validate statistics maturity.
 
 ## What It Checks
 
@@ -11,8 +11,6 @@ Indexes with zero scans that are larger than 500 MB. These indexes consume disk 
 INSERT/UPDATE/DELETE operations without providing query benefits.
 Details disclose the statistics window (since `pg_stat_database.stats_reset`) so "0 scans" is interpretable.
 
-**Severity**: WARN
-
 **Excludes**:
 - Primary keys (required for constraints)
 - Unique indexes (enforce data integrity)
@@ -20,14 +18,13 @@ Details disclose the statistics window (since `pg_stat_database.stats_reset`) so
 ### Low Usage Indexes (`low-usage-indexes`)
 Indexes larger than 500 MB with more than 10,000 table writes and at least one scan but a sustained rate
 below 1 per week, over a statistics window of at least 30 days. The window is measured by the server, so the
-clock on the host running pgdoctor does not affect which indexes are listed. Zero-scan indexes surface as unused-indexes.
+clock on the host running pgdoctor does not affect which indexes are listed. When no statistics reset is recorded,
+the server uptime is the window. With a shorter window, the check does not evaluate read rates. Zero-scan indexes surface as unused-indexes.
 These indexes have high maintenance costs relative to their query benefits.
-
-**Severity**: INFO
 
 ## Statistics Requirements
 
-This check requires at least **7 days** of statistics history for accurate results. If statistics were recently reset (PostgreSQL restart, manual reset), the check will warn about insufficient data.
+This check requires at least **7 days** of statistics history for accurate results. If statistics were recently reset (PostgreSQL restart, manual reset), wait until the history is long enough before you drop an index.
 
 ## Important Considerations
 
@@ -57,7 +54,7 @@ Unused indexes waste disk space and slow down writes.
 
 ```sql
 -- Verify usage on all instances
-SELECT idx_scan FROM pg_stat_user_indexes WHERE indexrelname = 'index_name';
+SELECT schemaname, relname, idx_scan FROM pg_stat_user_indexes WHERE indexrelname = 'index_name';
 
 -- Drop unused index
 DROP INDEX CONCURRENTLY schema.index_name;

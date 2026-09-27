@@ -43,17 +43,19 @@ type rowBuilder struct {
 func makeRow(tableName string) *rowBuilder {
 	return &rowBuilder{
 		row: db.TableVacuumHealthRow{
-			TableName:        pgtype.Text{String: tableName, Valid: true},
-			EstimatedRows:    pgtype.Int8{Int64: 0, Valid: true},
-			TableSizeBytes:   pgtype.Int8{Int64: 0, Valid: true},
-			NDeadTup:         pgtype.Int8{Int64: 0, Valid: true},
-			VacuumCount:      pgtype.Int8{Int64: 0, Valid: true},
-			AutovacuumCount:  pgtype.Int8{Int64: 0, Valid: true},
-			Reloptions:       pgtype.Text{String: "", Valid: false},
-			NModSinceAnalyze: pgtype.Int8{Int64: 0, Valid: true},
-			AnalyzeCount:     pgtype.Int8{Int64: 0, Valid: true},
-			AutoanalyzeCount: pgtype.Int8{Int64: 0, Valid: true},
-			NInsSinceVacuum:  pgtype.Int8{Int64: 0, Valid: true},
+			TableName:         pgtype.Text{String: tableName, Valid: true},
+			EstimatedRows:     pgtype.Int8{Int64: 0, Valid: true},
+			TableSizeBytes:    pgtype.Int8{Int64: 0, Valid: true},
+			NDeadTup:          pgtype.Int8{Int64: 0, Valid: true},
+			VacuumCount:       pgtype.Int8{Int64: 0, Valid: true},
+			AutovacuumCount:   pgtype.Int8{Int64: 0, Valid: true},
+			Reloptions:        pgtype.Text{String: "", Valid: false},
+			NModSinceAnalyze:  pgtype.Int8{Int64: 0, Valid: true},
+			AnalyzeCount:      pgtype.Int8{Int64: 0, Valid: true},
+			AutoanalyzeCount:  pgtype.Int8{Int64: 0, Valid: true},
+			NInsSinceVacuum:   pgtype.Int8{Int64: 0, Valid: true},
+			VacuumScaleFactor: pgtype.Float8{Float64: 0.2, Valid: true},
+			VacuumTrigger:     pgtype.Int8{Int64: 50, Valid: true},
 		},
 	}
 }
@@ -68,6 +70,11 @@ func (b *rowBuilder) withSize(sizeBytes int64) *rowBuilder {
 	return b
 }
 
+func (b *rowBuilder) withNoSize() *rowBuilder {
+	b.row.TableSizeBytes = pgtype.Int8{}
+	return b
+}
+
 func (b *rowBuilder) withDeadTuples(deadTup int64) *rowBuilder {
 	b.row.NDeadTup = pgtype.Int8{Int64: deadTup, Valid: true}
 	return b
@@ -75,6 +82,26 @@ func (b *rowBuilder) withDeadTuples(deadTup int64) *rowBuilder {
 
 func (b *rowBuilder) withReloptions(reloptions string) *rowBuilder {
 	b.row.Reloptions = pgtype.Text{String: reloptions, Valid: reloptions != ""}
+	return b
+}
+
+func (b *rowBuilder) withScaleFactor(scaleFactor float64) *rowBuilder {
+	b.row.VacuumScaleFactor = pgtype.Float8{Float64: scaleFactor, Valid: true}
+	return b
+}
+
+func (b *rowBuilder) withTrigger(trigger int64) *rowBuilder {
+	b.row.VacuumTrigger = pgtype.Int8{Int64: trigger, Valid: true}
+	return b
+}
+
+func (b *rowBuilder) withNoTrigger() *rowBuilder {
+	b.row.VacuumTrigger = pgtype.Int8{}
+	return b
+}
+
+func (b *rowBuilder) withAutovacuumDisabled() *rowBuilder {
+	b.row.AutovacuumDisabled = pgtype.Bool{Bool: true, Valid: true}
 	return b
 }
 
@@ -131,7 +158,7 @@ func (b *rowBuilder) build() db.TableVacuumHealthRow {
 func runCheck(t *testing.T, rows []db.TableVacuumHealthRow) *check.Report {
 	t.Helper()
 
-	checker := tablevacuumhealth.New(&mockQueryer{rows: rows})
+	checker := tablevacuumhealth.New(&mockQueryer{rows: rows}, tablevacuumhealth.DefaultConfig())
 	report, err := checker.Check(context.Background())
 	require.NoError(t, err)
 	checktest.AssertSeverityInvariant(t, report)
@@ -188,7 +215,7 @@ func TestTableVacuumHealth_AutovacuumDisabled_Found(t *testing.T) {
 	report := runCheck(t, []db.TableVacuumHealthRow{
 		makeRow("public.staging_table").
 			withRows(10000).
-			withReloptions("autovacuum_enabled=false").
+			withAutovacuumDisabled().
 			withLastVacuumAge(recent).
 			withLastAnalyzeAge(recent).
 			build(),
@@ -203,14 +230,12 @@ func TestTableVacuumHealth_AutovacuumDisabled_Found(t *testing.T) {
 	assert.Equal(t, check.SeverityWarn, disabled.Table.Rows[0].Severity)
 }
 
-// One row per table lets a consumer act on, or suppress, a single table;
-// a comma-joined sentence did not. Worst offenders by dead tuples come first.
 func TestTableVacuumHealth_AutovacuumDisabled_OneRowPerTableSortedByDeadTuples(t *testing.T) {
 	t.Parallel()
 
 	report := runCheck(t, []db.TableVacuumHealthRow{
-		makeRow("public.quiet").withReloptions("autovacuum_enabled=false").withDeadTuples(10).build(),
-		makeRow("public.busy").withReloptions("autovacuum_enabled=false").withDeadTuples(5_000).build(),
+		makeRow("public.quiet").withAutovacuumDisabled().withDeadTuples(10).build(),
+		makeRow("public.busy").withAutovacuumDisabled().withDeadTuples(5_000).build(),
 		makeRow("public.normal").withLastVacuumAge(recent).withLastAnalyzeAge(recent).build(),
 	})
 
@@ -219,6 +244,152 @@ func TestTableVacuumHealth_AutovacuumDisabled_OneRowPerTableSortedByDeadTuples(t
 	require.Len(t, disabled.Table.Rows, 2)
 	assert.Equal(t, "public.busy", disabled.Table.Rows[0].Cells[0])
 	assert.Equal(t, "public.quiet", disabled.Table.Rows[1].Cells[0])
+}
+
+func TestTableVacuumHealth_SizeCell(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		findingID string
+		row       *rowBuilder
+	}{
+		{
+			name:      "autovacuum disabled",
+			findingID: findingIDAutovacuumDisabled,
+			row:       makeRow("public.events").withAutovacuumDisabled(),
+		},
+		{
+			name:      "vacuum stale",
+			findingID: findingIDVacuumStale,
+			row:       makeRow("public.events").withDeadTuples(500_000).withLastVacuumAge(staleFail).withLastAnalyzeAge(recent),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			report := runCheck(t, []db.TableVacuumHealthRow{
+				tt.row.withSize(8192).build(),
+			})
+			finding := findingByID(t, report, tt.findingID)
+			require.NotNil(t, finding.Table)
+			assert.Equal(t, "8.0KiB", finding.Table.Rows[0].Cells[2])
+
+			report = runCheck(t, []db.TableVacuumHealthRow{
+				tt.row.withNoSize().build(),
+			})
+			finding = findingByID(t, report, tt.findingID)
+			require.NotNil(t, finding.Table)
+			assert.Equal(t, "-", finding.Table.Rows[0].Cells[2])
+		})
+	}
+}
+
+func TestTableVacuumHealth_AutovacuumDisabled_Exclude(t *testing.T) {
+	t.Parallel()
+
+	rows := []db.TableVacuumHealthRow{
+		makeRow("public.outbox_events").withAutovacuumDisabled().build(),
+		makeRow("tenant_1.outbox_events_p20260101").withAutovacuumDisabled().build(),
+		makeRow("public.audit_logs").withAutovacuumDisabled().build(),
+		makeRow("public.staging").withAutovacuumDisabled().build(),
+		makeRow("audit_logs.orders").withAutovacuumDisabled().build(),
+	}
+
+	tests := []struct {
+		name     string
+		exclude  []string
+		expected []string
+	}{
+		{
+			name:     "no config reports every table",
+			expected: []string{"public.outbox_events", "tenant_1.outbox_events_p20260101", "public.audit_logs", "public.staging", "audit_logs.orders"},
+		},
+		{
+			name:     "prefix excludes a table and its partition leaves by schema-qualified name",
+			exclude:  []string{"public.outbox_events", "tenant_1.outbox_events", "public.audit_logs"},
+			expected: []string{"public.staging", "audit_logs.orders"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := tablevacuumhealth.Config{IgnoreTables: tt.exclude}
+			report, err := tablevacuumhealth.New(&mockQueryer{rows: rows}, cfg).Check(context.Background())
+			require.NoError(t, err)
+			checktest.AssertSeverityInvariant(t, report)
+
+			disabled := findingByID(t, report, findingIDAutovacuumDisabled)
+			assert.Equal(t, fmt.Sprintf("Found %d table(s) with autovacuum disabled", len(tt.expected)), disabled.Details)
+			require.NotNil(t, disabled.Table)
+			var got []string
+			for _, row := range disabled.Table.Rows {
+				got = append(got, row.Cells[0])
+			}
+			assert.ElementsMatch(t, tt.expected, got)
+		})
+	}
+}
+
+func TestTableVacuumHealth_ConfigValidate(t *testing.T) {
+	t.Parallel()
+
+	require.NoError(t, tablevacuumhealth.DefaultConfig().Validate())
+	require.NoError(t, tablevacuumhealth.Config{IgnoreTables: []string{"public.outbox_events"}}.Validate())
+	require.Error(t, tablevacuumhealth.Config{IgnoreTables: []string{"public.outbox_events", ""}}.Validate())
+}
+
+func TestTableVacuumHealth_AutovacuumDisabled_ExcludeAll(t *testing.T) {
+	t.Parallel()
+
+	cfg := tablevacuumhealth.Config{IgnoreTables: []string{"public.outbox_events"}}
+	rows := []db.TableVacuumHealthRow{
+		makeRow("public.outbox_events").withAutovacuumDisabled().build(),
+	}
+
+	report, err := tablevacuumhealth.New(&mockQueryer{rows: rows}, cfg).Check(context.Background())
+	require.NoError(t, err)
+	checktest.AssertSeverityInvariant(t, report)
+
+	disabled := findingByID(t, report, findingIDAutovacuumDisabled)
+	assert.Equal(t, check.SeverityPass, disabled.Severity)
+	assert.Nil(t, disabled.Table)
+}
+
+func TestTableVacuumHealth_AutovacuumDisabled_ExcludeKeepsOtherFindings(t *testing.T) {
+	t.Parallel()
+
+	cfg := tablevacuumhealth.Config{IgnoreTables: []string{"public.outbox_events"}}
+	rows := []db.TableVacuumHealthRow{
+		makeRow("public.outbox_events").
+			withAutovacuumDisabled().
+			withRows(5_000_000).
+			withDeadTuples(600_000).
+			withLastVacuumAge(staleFail).
+			withLastAnalyzeAge(recent).
+			build(),
+	}
+
+	report, err := tablevacuumhealth.New(&mockQueryer{rows: rows}, cfg).Check(context.Background())
+	require.NoError(t, err)
+	checktest.AssertSeverityInvariant(t, report)
+
+	assert.Equal(t, check.SeverityPass, findingByID(t, report, findingIDAutovacuumDisabled).Severity)
+
+	large := findingByID(t, report, findingIDLargeTableDefaults)
+	require.NotNil(t, large.Table)
+	require.Len(t, large.Table.Rows, 1)
+	assert.Equal(t, "public.outbox_events", large.Table.Rows[0].Cells[0])
+
+	stale := findingByID(t, report, findingIDVacuumStale)
+	assert.Equal(t, check.SeverityFail, stale.Severity)
+	require.NotNil(t, stale.Table)
+	require.Len(t, stale.Table.Rows, 1)
+	assert.Equal(t, "public.outbox_events", stale.Table.Rows[0].Cells[0])
 }
 
 // Column indices for the large-table-defaults table:
@@ -284,6 +455,21 @@ func TestTableVacuumHealth_LargeTableDefaults_Detection(t *testing.T) {
 			row:    makeRow("public.partial").withRows(5_000_000).withReloptions("autovacuum_vacuum_threshold=1000").withLastVacuumAge(recent).build(),
 			listed: true,
 		},
+		{
+			name:   "tuned global scale factor is ignored",
+			row:    makeRow("public.global").withRows(5_000_000).withScaleFactor(0.05).withLastVacuumAge(recent).build(),
+			listed: false,
+		},
+		{
+			name:   "global scale factor above the default is listed",
+			row:    makeRow("public.lax").withRows(5_000_000).withScaleFactor(0.3).withLastVacuumAge(recent).build(),
+			listed: true,
+		},
+		{
+			name:   "partitioned parent without a trigger is ignored",
+			row:    makeRow("public.parent").withRows(5_000_000).withNoTrigger().build(),
+			listed: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -303,25 +489,18 @@ func TestTableVacuumHealth_LargeTableDefaults_Detection(t *testing.T) {
 	}
 }
 
-func TestTableVacuumHealth_LargeTableDefaults_TriggerAtMath(t *testing.T) {
+func TestTableVacuumHealth_LargeTableDefaults_TriggerAndPending(t *testing.T) {
 	t.Parallel()
 
-	// trigger = 0.2 * rows + 50. Custom threshold does not change the default formula.
+	// Inserts have their own autovacuum trigger, so they are not pending against the dead-tuple trigger.
 	finding := largeTableFinding(t, []db.TableVacuumHealthRow{
-		makeRow("public.a").withRows(2_000_000).withDeadTuples(300_000).withInsSinceVacuum(50_000).withLastVacuumAge(recent).build(),
-		makeRow("public.b").withRows(1_000_000).withReloptions("autovacuum_vacuum_threshold=1000").withLastVacuumAge(recent).build(),
+		makeRow("public.a").withRows(2_000_000).withTrigger(401_000).withDeadTuples(300_000).withInsSinceVacuum(150_000).withLastVacuumAge(recent).build(),
 	})
 
-	byName := map[string]check.TableRow{}
-	for _, r := range finding.Table.Rows {
-		byName[r.Cells[0]] = r
-	}
-
-	// 0.2*2M+50 = 400050 -> "400.1K"; pending 300K+50K = 350K -> "350.0K".
-	assert.Equal(t, "400.1K", byName["public.a"].Cells[ltdTriggerAt])
-	assert.Equal(t, "350.0K", byName["public.a"].Cells[ltdPending])
-	// 0.2*1M+50 = 200050 -> "200.1K".
-	assert.Equal(t, "200.1K", byName["public.b"].Cells[ltdTriggerAt])
+	require.Len(t, finding.Table.Rows, 1)
+	assert.Equal(t, "401.0K", finding.Table.Rows[0].Cells[ltdTriggerAt])
+	assert.Equal(t, "300.0K", finding.Table.Rows[0].Cells[ltdPending])
+	assert.NotEqual(t, "overdue", finding.Table.Rows[0].Cells[ltdEstNext])
 }
 
 func TestTableVacuumHealth_LargeTableDefaults_EstNextVacuum(t *testing.T) {
@@ -334,14 +513,17 @@ func TestTableVacuumHealth_LargeTableDefaults_EstNextVacuum(t *testing.T) {
 	}{
 		{
 			name: "overdue when pending crosses trigger",
-			// trigger 200050, pending 250000 >= trigger.
-			row:  makeRow("public.over").withRows(1_000_000).withDeadTuples(250_000).withLastVacuumAge(recent).build(),
+			row:  makeRow("public.over").withRows(1_000_000).withTrigger(200_050).withDeadTuples(250_000).withLastVacuumAge(recent).build(),
 			want: "overdue",
 		},
 		{
+			name: "pending equal to trigger is not overdue",
+			row:  makeRow("public.edge").withRows(1_000_000).withTrigger(200_050).withDeadTuples(200_050).withLastVacuumAge(recent).build(),
+			want: "<1h",
+		},
+		{
 			name: "never vacuumed has no rate",
-			// pending below trigger, no last-vacuum timestamp.
-			row:  makeRow("public.new").withRows(2_000_000).withDeadTuples(100_000).build(),
+			row:  makeRow("public.new").withRows(2_000_000).withTrigger(400_050).withDeadTuples(100_000).build(),
 			want: noEstimate,
 		},
 		{
@@ -365,9 +547,9 @@ func TestTableVacuumHealth_LargeTableDefaults_EstNextVacuum(t *testing.T) {
 func TestTableVacuumHealth_LargeTableDefaults_EstNextVacuum_DaysEstimate(t *testing.T) {
 	t.Parallel()
 
-	// trigger 2,000,050; pending 100K accrued over 10 days -> a coarse day estimate.
+	// Pending 100K accrued over 10 days -> a coarse day estimate.
 	finding := largeTableFinding(t, []db.TableVacuumHealthRow{
-		makeRow("public.slow").withRows(10_000_000).withDeadTuples(100_000).withLastVacuumAge(staleWarn).build(),
+		makeRow("public.slow").withRows(10_000_000).withTrigger(2_000_050).withDeadTuples(100_000).withLastVacuumAge(staleWarn).build(),
 	})
 
 	require.Len(t, finding.Table.Rows, 1)
@@ -704,10 +886,24 @@ func TestTableVacuumHealth_VacuumStale_SortedWorstFirst(t *testing.T) {
 	assert.Equal(t, "public.warn_small", stale.Table.Rows[2].Cells[0])
 }
 
+func TestTableVacuumHealth_VacuumStale_SameNameInTwoSchemas(t *testing.T) {
+	t.Parallel()
+
+	report := runCheck(t, []db.TableVacuumHealthRow{
+		makeRow("tenant_a.orders").withRows(2_000_000).withDeadTuples(300_000).withLastVacuumAge(staleWarn).withLastAnalyzeAge(recent).build(),
+		makeRow("tenant_b.orders").withRows(2_000_000).withDeadTuples(260_000).withLastVacuumAge(staleWarn).withLastAnalyzeAge(recent).build(),
+	})
+
+	stale := findingByID(t, report, findingIDVacuumStale)
+	require.Len(t, stale.Table.Rows, 2)
+	assert.Equal(t, "tenant_a.orders", stale.Table.Rows[0].Cells[0])
+	assert.Equal(t, "tenant_b.orders", stale.Table.Rows[1].Cells[0])
+}
+
 func TestTableVacuumHealth_QueryError(t *testing.T) {
 	t.Parallel()
 
-	checker := tablevacuumhealth.New(&mockQueryer{err: fmt.Errorf("database connection error")})
+	checker := tablevacuumhealth.New(&mockQueryer{err: fmt.Errorf("database connection error")}, tablevacuumhealth.DefaultConfig())
 	_, err := checker.Check(context.Background())
 
 	require.Error(t, err)
@@ -717,7 +913,7 @@ func TestTableVacuumHealth_QueryError(t *testing.T) {
 func TestTableVacuumHealth_Metadata(t *testing.T) {
 	t.Parallel()
 
-	metadata := tablevacuumhealth.New(&mockQueryer{}).Metadata()
+	metadata := tablevacuumhealth.New(&mockQueryer{}, tablevacuumhealth.DefaultConfig()).Metadata()
 
 	assert.Equal(t, "table-vacuum-health", metadata.CheckID)
 	assert.Equal(t, "Table Vacuum Health", metadata.Name)

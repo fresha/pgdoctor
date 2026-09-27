@@ -35,7 +35,7 @@ func Metadata() check.Metadata {
 	}
 }
 
-func New(queries UUIDTypesQueries, _ ...check.Config) check.Checker {
+func New(queries UUIDTypesQueries) check.Checker {
 	return &checker{
 		queries: queries,
 	}
@@ -72,7 +72,7 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 				row.ColumnType,
 				check.FormatBytes(row.TableSizeBytes),
 			},
-			Severity: check.SeverityFail,
+			Severity: check.SeverityWarn,
 		})
 	}
 

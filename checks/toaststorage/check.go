@@ -49,7 +49,7 @@ func Metadata() check.Metadata {
 	}
 }
 
-func New(queries ToastStorageQueries, _ ...check.Config) check.Checker {
+func New(queries ToastStorageQueries) check.Checker {
 	return &checker{
 		queries: queries,
 	}
@@ -62,6 +62,17 @@ func (c *checker) Metadata() check.Metadata {
 func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 	report := check.NewReport(Metadata())
 
+	if meta := check.InstanceMetadataFromContext(ctx); meta != nil && meta.EngineVersionMajor > 0 && meta.EngineVersionMajor < 14 {
+		report.AddFinding(check.Finding{
+			ID:       report.CheckID,
+			Name:     report.Name,
+			Severity: check.SeveritySkip,
+			Details:  fmt.Sprintf("TOAST compression columns need PostgreSQL 14 or newer, server is %d", meta.EngineVersionMajor),
+		})
+		report.Severity = check.SeveritySkip
+		return report, nil
+	}
+
 	rows, err := c.queries.ToastStorage(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to analyze TOAST storage: %w", err)
@@ -72,8 +83,8 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 
 	if len(rows) == 0 {
 		report.AddFinding(check.Finding{
-			ID:       report.CheckID,
-			Name:     report.Name,
+			ID:       "toast-usage",
+			Name:     "TOAST Usage",
 			Severity: check.SeverityPass,
 			Details:  "No tables with significant TOAST storage found",
 		})
@@ -131,7 +142,7 @@ func checkToastHeavy(rows []db.ToastStorageRow, report *check.Report) {
 			ID:       "toast-ratio",
 			Name:     "TOAST-Heavy Tables",
 			Severity: check.SeverityPass,
-			Details:  "No TOAST-heavy tables (>50% ratio or >10GB)",
+			Details:  "No TOAST-heavy tables (>50% ratio or >10GiB)",
 		})
 		return
 	}
@@ -158,7 +169,7 @@ func checkToastHeavy(rows []db.ToastStorageRow, report *check.Report) {
 		ID:       "toast-ratio",
 		Name:     "TOAST-Heavy Tables",
 		Severity: check.SeverityInfo,
-		Details:  fmt.Sprintf("Found %d TOAST-heavy table(s) (>50%% ratio or >10GB)", len(heavy)),
+		Details:  fmt.Sprintf("Found %d TOAST-heavy table(s) (>50%% ratio or >10GiB)", len(heavy)),
 		Table: &check.Table{
 			Headers: headers,
 			Rows:    tableRows,

@@ -13,8 +13,7 @@ import (
 
 const brokenIndexes = `-- name: BrokenIndexes :many
 SELECT
-  n.nspname::text AS schema_name
-  , tbl.relname::text AS table_name
+  (n.nspname || '.' || tbl.relname)::text AS table_name
   , idx.relname::text AS index_name
   , (idx.relname ~ '_cc(new|old)[0-9]*$') AS is_leftover
 FROM pg_index AS i
@@ -31,7 +30,6 @@ ORDER BY is_leftover, n.nspname, tbl.relname, idx.relname
 `
 
 type BrokenIndexesRow struct {
-	SchemaName pgtype.Text
 	TableName  pgtype.Text
 	IndexName  pgtype.Text
 	IsLeftover pgtype.Bool
@@ -49,12 +47,7 @@ func (q *Queries) BrokenIndexes(ctx context.Context) ([]BrokenIndexesRow, error)
 	var items []BrokenIndexesRow
 	for rows.Next() {
 		var i BrokenIndexesRow
-		if err := rows.Scan(
-			&i.SchemaName,
-			&i.TableName,
-			&i.IndexName,
-			&i.IsLeftover,
-		); err != nil {
+		if err := rows.Scan(&i.TableName, &i.IndexName, &i.IsLeftover); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -75,6 +68,8 @@ SELECT
   , count(*) FILTER (WHERE state = 'idle in transaction') AS idle_in_transaction
   , count(*) FILTER (WHERE state = 'idle in transaction (aborted)') AS idle_in_transaction_aborted
   , count(*) FILTER (WHERE wait_event_type IS NOT NULL AND state = 'active') AS waiting_connections
+  -- Processes with no datid or no usesysid are masked for every role without pg_read_all_stats.
+  , count(*) FILTER (WHERE datid IS NOT NULL AND usesysid IS NOT NULL AND query = '<insufficient privilege>') AS hidden_connections
 FROM pg_stat_activity
 WHERE pid != pg_backend_pid()
 `
@@ -88,6 +83,7 @@ type ConnectionStatsRow struct {
 	IdleInTransaction        pgtype.Int8
 	IdleInTransactionAborted pgtype.Int8
 	WaitingConnections       pgtype.Int8
+	HiddenConnections        pgtype.Int8
 }
 
 // Gets overall connection statistics including pool sizing metrics.
@@ -103,6 +99,7 @@ func (q *Queries) ConnectionStats(ctx context.Context) (ConnectionStatsRow, erro
 		&i.IdleInTransaction,
 		&i.IdleInTransactionAborted,
 		&i.WaitingConnections,
+		&i.HiddenConnections,
 	)
 	return i, err
 }
@@ -214,6 +211,31 @@ func (q *Queries) DatabaseFreezeAge(ctx context.Context) (DatabaseFreezeAgeRow, 
 	return i, err
 }
 
+const databaseStatistics = `-- name: DatabaseStatistics :one
+SELECT
+  stats_reset
+  , extract(EPOCH FROM (now() - stats_reset))::bigint AS age_seconds
+  , extract(EPOCH FROM (now() - pg_postmaster_start_time()))::bigint AS uptime_seconds
+FROM pg_stat_database
+WHERE datname = current_database()
+`
+
+type DatabaseStatisticsRow struct {
+	StatsReset    pgtype.Timestamptz
+	AgeSeconds    pgtype.Int8
+	UptimeSeconds pgtype.Int8
+}
+
+// Returns statistics age for the current database.
+// Only pg_stat_reset() records a timestamp; a crash or rebuilt replica zeroes the
+// counters silently, so uptime is the lower bound when stats_reset is NULL.
+func (q *Queries) DatabaseStatistics(ctx context.Context) (DatabaseStatisticsRow, error) {
+	row := q.db.QueryRow(ctx, databaseStatistics)
+	var i DatabaseStatisticsRow
+	err := row.Scan(&i.StatsReset, &i.AgeSeconds, &i.UptimeSeconds)
+	return i, err
+}
+
 const duplicateIndexes = `-- name: DuplicateIndexes :many
 WITH index_columns AS (
   SELECT
@@ -223,7 +245,13 @@ WITH index_columns AS (
     , t.relname AS table_name
     , n.nspname AS schema_name
     , idx.indkey::int [] AS column_positions
+    , idx.indclass::oid [] AS column_opclasses
+    , idx.indcollation::oid [] AS column_collations
+    , idx.indoption::int [] AS column_options
     , idx.indnkeyatts AS num_key_columns
+    , i.relam AS access_method
+    , (idx.indisunique OR idx.indisexclusion) AS enforces_constraint
+    , (idx.indnatts > idx.indnkeyatts) AS has_include_columns
     -- Extract column list as array for prefix comparison
     , pg_get_indexdef(idx.indexrelid) AS index_def
     , pg_relation_size(i.oid) AS index_size_bytes
@@ -276,7 +304,14 @@ WITH index_columns AS (
     a.indrelid = b.indrelid
     AND a.indexrelid <> b.indexrelid
     AND a.num_key_columns < b.num_key_columns
-    AND a.column_positions = b.column_positions[0:a.num_key_columns]
+    AND a.access_method = b.access_method
+    AND NOT a.enforces_constraint
+    AND NOT a.has_include_columns
+    -- Vector columns start at index 0; a slice always has lower bound 1.
+    AND a.column_positions[0:a.num_key_columns - 1] = b.column_positions[0:a.num_key_columns - 1]
+    AND a.column_opclasses[0:a.num_key_columns - 1] = b.column_opclasses[0:a.num_key_columns - 1]
+    AND a.column_collations[0:a.num_key_columns - 1] = b.column_collations[0:a.num_key_columns - 1]
+    AND a.column_options[0:a.num_key_columns - 1] = b.column_options[0:a.num_key_columns - 1]
     AND NOT a.is_expression_index
     AND NOT b.is_expression_index
     AND NOT a.is_partial_index
@@ -422,8 +457,9 @@ LEFT JOIN pg_stat_user_tables AS s ON c.oid = s.relid
 LEFT JOIN table_indexes AS ti ON c.oid = ti.table_oid
 WHERE
   c.relkind IN ('r', 'p')
-  AND n.nspname = 'public'
-  AND coalesce(s.n_live_tup, 0) > 10000
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+  AND c.relpersistence <> 't'
+  AND coalesce(s.n_live_tup, 0) >= $1::bigint
   AND coalesce(s.seq_scan, 0) > 100
 ORDER BY
   coalesce(s.seq_scan, 0) DESC
@@ -440,9 +476,9 @@ type HighSeqScanTablesRow struct {
 }
 
 // Identifies tables with excessive sequential scans relative to index scans.
-// Excludes: small tables, system schemas, tables with no indexes.
-func (q *Queries) HighSeqScanTables(ctx context.Context) ([]HighSeqScanTablesRow, error) {
-	rows, err := q.db.Query(ctx, highSeqScanTables)
+// Excludes: tables below min_rows, system schemas, temporary tables, tables with no indexes.
+func (q *Queries) HighSeqScanTables(ctx context.Context, minRows int64) ([]HighSeqScanTablesRow, error) {
+	rows, err := q.db.Query(ctx, highSeqScanTables, minRows)
 	if err != nil {
 		return nil, err
 	}
@@ -579,33 +615,26 @@ SELECT
   , pg_stat_activity.datname::text AS database_name
   , pg_stat_activity.application_name::text AS application_name
   , pg_stat_activity.state::text AS state
-  , extract(EPOCH FROM (now() - pg_stat_activity.xact_start))::bigint AS transaction_duration_seconds
+  , extract(EPOCH FROM (now() - pg_stat_activity.state_change))::bigint AS idle_duration_seconds
   , left(pg_stat_activity.query, 200)::text AS query_preview
-  , coalesce((
-    SELECT pg_settings.setting::bigint
-    FROM pg_settings
-    WHERE pg_settings.name = 'idle_in_transaction_session_timeout'
-  ), 0) AS timeout_ms
 FROM pg_stat_activity
 WHERE
   pg_stat_activity.state IN ('idle in transaction', 'idle in transaction (aborted)')
   AND pg_stat_activity.pid != pg_backend_pid()
-ORDER BY pg_stat_activity.xact_start ASC
+ORDER BY pg_stat_activity.state_change ASC
 `
 
 type IdleInTransactionRow struct {
-	Pid                        pgtype.Int4
-	Username                   pgtype.Text
-	DatabaseName               pgtype.Text
-	ApplicationName            pgtype.Text
-	State                      pgtype.Text
-	TransactionDurationSeconds pgtype.Int8
-	QueryPreview               pgtype.Text
-	TimeoutMs                  pgtype.Int8
+	Pid                 pgtype.Int4
+	Username            pgtype.Text
+	DatabaseName        pgtype.Text
+	ApplicationName     pgtype.Text
+	State               pgtype.Text
+	IdleDurationSeconds pgtype.Int8
+	QueryPreview        pgtype.Text
 }
 
 // Identifies connections stuck in 'idle in transaction' state.
-// Includes the timeout setting (in ms) for threshold calculation in Go.
 func (q *Queries) IdleInTransaction(ctx context.Context) ([]IdleInTransactionRow, error) {
 	rows, err := q.db.Query(ctx, idleInTransaction)
 	if err != nil {
@@ -621,9 +650,8 @@ func (q *Queries) IdleInTransaction(ctx context.Context) ([]IdleInTransactionRow
 			&i.DatabaseName,
 			&i.ApplicationName,
 			&i.State,
-			&i.TransactionDurationSeconds,
+			&i.IdleDurationSeconds,
 			&i.QueryPreview,
-			&i.TimeoutMs,
 		); err != nil {
 			return nil, err
 		}
@@ -803,8 +831,10 @@ SELECT
   END AS cache_hit_ratio
 FROM pg_statio_user_indexes AS psio
 INNER JOIN ranked ON psio.indexrelid = ranked.indexrelid
+INNER JOIN pg_class AS c ON psio.indexrelid = c.oid
 WHERE
-  psio.schemaname = 'public'
+  psio.schemaname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+  AND c.relpersistence <> 't'
   -- rank<=20 rows bypass the size floor so the top-20 ranking is verifiable at --detail debug
   AND (pg_relation_size(psio.indexrelid) >= 500 * 1024 * 1024 OR ranked.scan_rank <= 20)
 ORDER BY pg_relation_size(psio.indexrelid) DESC
@@ -859,8 +889,9 @@ SELECT
   , coalesce(psai.idx_scan, 0) AS idx_scan
   , coalesce(ut.n_tup_ins, 0) + coalesce(ut.n_tup_upd, 0) + coalesce(ut.n_tup_del, 0) AS table_writes
   , (SELECT stats_reset FROM pg_stat_database WHERE datname = current_database())::timestamptz AS stats_reset
+  -- Counters survive a clean restart, so with no reset recorded the uptime is a lower bound of the window.
   , (
-    SELECT extract(EPOCH FROM (now() - stats_reset))::bigint
+    SELECT extract(EPOCH FROM (now() - coalesce(stats_reset, pg_postmaster_start_time())))::bigint
     FROM pg_stat_database WHERE datname = current_database()
   ) AS stats_age_seconds
 FROM pg_stat_user_indexes AS psai
@@ -869,7 +900,8 @@ INNER JOIN pg_class AS tbl ON x.indrelid = tbl.oid
 INNER JOIN pg_namespace AS n ON tbl.relnamespace = n.oid
 LEFT JOIN pg_stat_user_tables AS ut ON tbl.oid = ut.relid
 WHERE
-  n.nspname = 'public'
+  n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+  AND tbl.relpersistence <> 't'
 ORDER BY
   pg_relation_size(psai.indexrelid) DESC
 `
@@ -886,7 +918,7 @@ type IndexUsageStatsRow struct {
 	StatsAgeSeconds pgtype.Int8
 }
 
-// Excludes: system schemas. Returns data for subchecks: unused-indexes, low-usage-indexes.
+// Excludes: system schemas and temporary tables. Returns data for subchecks: unused-indexes, low-usage-indexes.
 func (q *Queries) IndexUsageStats(ctx context.Context) ([]IndexUsageStatsRow, error) {
 	rows, err := q.db.Query(ctx, indexUsageStats)
 	if err != nil {
@@ -962,7 +994,15 @@ func (q *Queries) InstalledExtensions(ctx context.Context) ([]InstalledExtension
 }
 
 const invalidPrimaryKeyTypes = `-- name: InvalidPrimaryKeyTypes :many
-WITH pk_tables AS (
+WITH pk_columns AS (
+  SELECT
+    con.conrelid AS table_oid
+    , UNNEST(con.conkey) AS column_num
+  FROM pg_catalog.pg_constraint AS con
+  WHERE con.contype = 'p'
+)
+
+, pk_tables AS (
   SELECT
     n.nspname::text AS schema_name
     , c.relname::text AS table_name
@@ -970,23 +1010,21 @@ WITH pk_tables AS (
     , a.attnum AS column_num
     , t.typname::text AS column_type
     , c.oid AS table_oid
-    , COALESCE(s.n_live_tup, 0)::bigint AS estimated_rows
+    , COALESCE(pg_stat_get_live_tuples(c.oid), 0)::bigint AS estimated_rows
     , CASE t.typname
       WHEN 'int2' THEN 32767::bigint
       WHEN 'int4' THEN 2147483647::bigint
     END AS type_max_value
-  FROM pg_catalog.pg_constraint AS con
-  INNER JOIN pg_catalog.pg_class AS c ON con.conrelid = c.oid
+  FROM pk_columns AS pk
+  INNER JOIN pg_catalog.pg_class AS c ON pk.table_oid = c.oid
   INNER JOIN pg_catalog.pg_namespace AS n ON c.relnamespace = n.oid
   INNER JOIN pg_catalog.pg_attribute AS a
     ON
-      con.conrelid = a.attrelid
-      AND a.attnum = ANY(con.conkey)
+      pk.table_oid = a.attrelid
+      AND pk.column_num = a.attnum
   INNER JOIN pg_catalog.pg_type AS t ON a.atttypid = t.oid
-  LEFT JOIN pg_stat_user_tables AS s ON c.oid = s.relid
   WHERE
-    con.contype = 'p'
-    AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pgpartman', 'pgjobmon', 'cron')
+    n.nspname NOT IN ('pg_catalog', 'information_schema', 'pgpartman', 'pgjobmon', 'cron')
     AND t.typname IN ('int2', 'int4')
     AND NOT EXISTS (
       SELECT 1 FROM pg_inherits AS inh
@@ -994,17 +1032,37 @@ WITH pk_tables AS (
     )
 )
 
-, sequence_values AS (
+, sequence_owners AS (
   SELECT
     d.refobjid AS table_oid
     , d.refobjsubid AS column_num
-    , seq.last_value::bigint AS sequence_current
-  FROM pg_depend AS d
-  INNER JOIN pg_class AS seq_class ON d.objid = seq_class.oid
-  INNER JOIN pg_sequences AS seq ON seq_class.relname = seq.sequencename
+    , d.objid AS sequence_oid
+  FROM pg_catalog.pg_depend AS d
+  INNER JOIN pg_catalog.pg_sequence AS s ON d.objid = s.seqrelid
   WHERE
-    d.deptype = 'a'
-    AND seq_class.relkind = 'S'
+    d.classid = 'pg_catalog.pg_class'::regclass
+    AND d.refclassid = 'pg_catalog.pg_class'::regclass
+    AND d.deptype IN ('a', 'i')
+)
+
+, pk_sequences AS (
+  SELECT
+    p.schema_name
+    , p.table_name
+    , p.column_name
+    , p.column_type
+    , p.estimated_rows
+    , p.type_max_value
+    , CASE
+      WHEN has_sequence_privilege(so.sequence_oid, 'SELECT,USAGE')
+        THEN pg_sequence_last_value(so.sequence_oid::regclass)
+    END AS sequence_current
+    , (so.sequence_oid IS NOT NULL AND NOT has_sequence_privilege(so.sequence_oid, 'SELECT,USAGE')) AS sequence_unreadable
+  FROM pk_tables AS p
+  LEFT JOIN sequence_owners AS so
+    ON
+      p.table_oid = so.table_oid
+      AND p.column_num = so.column_num
 )
 
 , pk_with_usage AS (
@@ -1013,21 +1071,18 @@ WITH pk_tables AS (
     , p.column_name
     , p.column_type
     , p.estimated_rows
-    , sv.sequence_current
+    , p.sequence_current
+    , p.sequence_unreadable
     , p.type_max_value
     , CASE
-      WHEN sv.sequence_current IS NOT NULL AND p.type_max_value > 0
-        THEN sv.sequence_current::numeric / p.type_max_value::numeric
+      WHEN p.sequence_current IS NOT NULL AND p.type_max_value > 0
+        THEN p.sequence_current::numeric / p.type_max_value::numeric
       WHEN p.estimated_rows > 0 AND p.type_max_value > 0
         THEN p.estimated_rows::numeric / p.type_max_value::numeric
       ELSE
         0::numeric
     END AS usage_pct
-  FROM pk_tables AS p
-  LEFT JOIN sequence_values AS sv
-    ON
-      p.table_oid = sv.table_oid
-      AND p.column_num = sv.column_num
+  FROM pk_sequences AS p
 )
 
 SELECT
@@ -1036,6 +1091,7 @@ SELECT
   , column_type
   , estimated_rows
   , sequence_current
+  , sequence_unreadable
   , type_max_value
   , usage_pct
 FROM pk_with_usage
@@ -1045,16 +1101,18 @@ ORDER BY
 `
 
 type InvalidPrimaryKeyTypesRow struct {
-	TableName       pgtype.Text
-	ColumnName      pgtype.Text
-	ColumnType      pgtype.Text
-	EstimatedRows   pgtype.Int8
-	SequenceCurrent pgtype.Int8
-	TypeMaxValue    pgtype.Int8
-	UsagePct        pgtype.Numeric
+	TableName          string
+	ColumnName         string
+	ColumnType         string
+	EstimatedRows      int64
+	SequenceCurrent    pgtype.Int8
+	SequenceUnreadable pgtype.Bool
+	TypeMaxValue       pgtype.Int8
+	UsagePct           pgtype.Numeric
 }
 
 // Identifies tables with integer primary keys (int2/int4) that should use bigint.
+// serial columns own their sequence with deptype 'a', IDENTITY columns with 'i'.
 func (q *Queries) InvalidPrimaryKeyTypes(ctx context.Context) ([]InvalidPrimaryKeyTypesRow, error) {
 	rows, err := q.db.Query(ctx, invalidPrimaryKeyTypes)
 	if err != nil {
@@ -1070,6 +1128,7 @@ func (q *Queries) InvalidPrimaryKeyTypes(ctx context.Context) ([]InvalidPrimaryK
 			&i.ColumnType,
 			&i.EstimatedRows,
 			&i.SequenceCurrent,
+			&i.SequenceUnreadable,
 			&i.TypeMaxValue,
 			&i.UsagePct,
 		); err != nil {
@@ -1112,8 +1171,16 @@ LEFT JOIN inheritance_info AS ii ON c.oid = ii.child_oid
 WHERE
   c.relkind IN ('r', 'p')
   AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'pgpartman', 'debezium', 'cron')
-  AND COALESCE(s.n_live_tup, 0) >= 10000000
+  AND COALESCE(s.n_live_tup, 0) >= CASE
+    WHEN ii.parent_table IS NULL THEN $1::bigint
+    ELSE $2::bigint
+  END
 `
+
+type LargeTablesParams struct {
+	MinTableRows     int64
+	MinPartitionRows int64
+}
 
 type LargeTablesRow struct {
 	TableName      pgtype.Text
@@ -1128,11 +1195,11 @@ type LargeTablesRow struct {
 	NTupDel        pgtype.Int8
 }
 
-// Identifies all large tables (>= 10M rows) with partitioning and transient status.
+// Identifies all large tables (>= min_table_rows) and large partitions (>= min_partition_rows) with partitioning and transient status.
 // Returns both regular and partitioned tables for unified analysis.
-// Includes activity metrics (inserts/updates/deletes) for activity-aware thresholds.
-func (q *Queries) LargeTables(ctx context.Context) ([]LargeTablesRow, error) {
-	rows, err := q.db.Query(ctx, largeTables)
+// Includes activity metrics (inserts/updates/deletes) as context for each table.
+func (q *Queries) LargeTables(ctx context.Context, arg LargeTablesParams) ([]LargeTablesRow, error) {
+	rows, err := q.db.Query(ctx, largeTables, arg.MinTableRows, arg.MinPartitionRows)
 	if err != nil {
 		return nil, err
 	}
@@ -1846,17 +1913,39 @@ WITH sequence_info AS (
     s.schemaname::text AS schema_name
     , s.sequencename::text AS sequence_name
     , s.data_type::text AS seq_data_type
+    , s.min_value
     , s.max_value
     , s.increment_by
     , s.cycle AS is_cyclic
-    , COALESCE(s.last_value, s.start_value) AS current_value
-    , CASE
-      WHEN s.max_value > 0 AND COALESCE(s.last_value, s.start_value) > 0
-        THEN (COALESCE(s.last_value, s.start_value)::numeric / s.max_value::numeric) * 100
-      ELSE 0
-    END AS usage_percent
-    , (s.max_value - COALESCE(s.last_value, s.start_value)) / NULLIF(s.increment_by, 0) AS remaining_values
+    , cur.value AS current_value
+    , (cur.value IS NULL) AS is_unreadable
+    -- numeric: a full bigint range overflows bigint subtraction.
+    -- Usage counts from 0, or from the range bound when 0 is outside the range.
+    , CASE WHEN cur.value IS NOT NULL THEN GREATEST(0, CASE
+      WHEN s.increment_by > 0
+        THEN (cur.value - base.ascending::numeric) / NULLIF(s.max_value - base.ascending::numeric, 0)
+      ELSE (base.descending - cur.value::numeric) / NULLIF(base.descending - s.min_value::numeric, 0)
+    END) * 100 END AS usage_percent
+    , LEAST(TRUNC(CASE
+      WHEN s.increment_by > 0
+        THEN (s.max_value - cur.value::numeric) / s.increment_by
+      ELSE (cur.value - s.min_value::numeric) / -s.increment_by::numeric
+    END), 9223372036854775807)::bigint AS remaining_values
   FROM pg_sequences AS s
+  -- last_value is NULL both for a sequence never called and for one the role cannot read.
+  CROSS JOIN LATERAL (
+    SELECT CASE
+      WHEN s.last_value IS NOT NULL
+        THEN s.last_value
+      WHEN has_sequence_privilege(quote_ident(s.schemaname) || '.' || quote_ident(s.sequencename), 'SELECT,USAGE')
+        THEN s.start_value
+    END AS value
+  ) AS cur
+  CROSS JOIN LATERAL (
+    SELECT
+      CASE WHEN s.max_value > 0 THEN GREATEST(s.min_value, 0) ELSE s.min_value END AS ascending
+      , CASE WHEN s.min_value < 0 THEN LEAST(s.max_value, 0) ELSE s.max_value END AS descending
+  ) AS base
   WHERE s.schemaname NOT IN ('pg_catalog', 'information_schema')
 )
 
@@ -1908,22 +1997,37 @@ WITH sequence_info AS (
 
 SELECT
   si.schema_name
-  , si.sequence_name
+  , (si.schema_name || '.' || si.sequence_name)::text AS sequence_name
   , si.seq_data_type
   , si.current_value
+  , si.min_value
   , si.max_value
   , si.increment_by
   , si.is_cyclic
+  , si.is_unreadable
   , si.remaining_values
   , ROUND(si.usage_percent::numeric, 2) AS usage_percent
-  , COALESCE(so.table_name, '') AS table_name
+  , COALESCE(so.table_schema || '.' || so.table_name, '')::text AS table_name
   , COALESCE(so.column_name, '') AS column_name
   , COALESCE(so.column_type, '') AS column_type
   , COALESCE(so.column_max_value, 0) AS column_max_value
   -- Flag if sequence can generate values that exceed column type
-  , (so.column_max_value IS NOT NULL AND si.max_value > so.column_max_value) AS sequence_exceeds_column
-  -- Flag if this is an integer column that should probably be bigint
-  , (so.column_type != 'bigint' AND si.usage_percent > 50) AS should_be_bigint
+  , (
+    so.column_max_value IS NOT NULL
+    AND (si.max_value > so.column_max_value OR si.min_value < -so.column_max_value - 1)
+  ) AS sequence_exceeds_column
+  -- Usage of the column type range, from 0 toward the limit in the sequence direction.
+  -- A value already outside the range fails inserts in either direction, so it is above 100.
+  , CASE WHEN so.column_type IN ('integer', 'smallint') THEN ROUND(GREATEST(
+    0
+    , CASE
+      WHEN si.increment_by > 0
+        THEN si.current_value::numeric / so.column_max_value
+      ELSE -si.current_value::numeric / (so.column_max_value + 1)
+    END
+    , CASE WHEN si.current_value > so.column_max_value THEN si.current_value::numeric / so.column_max_value END
+    , CASE WHEN si.current_value < -so.column_max_value - 1 THEN -si.current_value::numeric / (so.column_max_value + 1) END
+  ) * 100, 2) END AS column_usage_percent
   -- Flag if column is a primary key
   , (pk.table_oid IS NOT NULL) AS is_primary_key
   -- Count of foreign keys referencing this column
@@ -1942,7 +2046,7 @@ LEFT JOIN fk_references AS fkr
   ON
     so.table_oid = fkr.referenced_table_oid
     AND so.column_num = fkr.referenced_column_num
-ORDER BY si.usage_percent DESC, si.remaining_values ASC
+ORDER BY si.usage_percent DESC NULLS LAST, si.remaining_values ASC
 `
 
 type SequenceHealthRow struct {
@@ -1950,9 +2054,11 @@ type SequenceHealthRow struct {
 	SequenceName          pgtype.Text
 	SeqDataType           pgtype.Text
 	CurrentValue          pgtype.Int8
+	MinValue              pgtype.Int8
 	MaxValue              pgtype.Int8
 	IncrementBy           pgtype.Int8
 	IsCyclic              pgtype.Bool
+	IsUnreadable          pgtype.Bool
 	RemainingValues       pgtype.Int8
 	UsagePercent          pgtype.Numeric
 	TableName             pgtype.Text
@@ -1960,7 +2066,7 @@ type SequenceHealthRow struct {
 	ColumnType            pgtype.Text
 	ColumnMaxValue        pgtype.Int8
 	SequenceExceedsColumn pgtype.Bool
-	ShouldBeBigint        pgtype.Bool
+	ColumnUsagePercent    pgtype.Numeric
 	IsPrimaryKey          pgtype.Bool
 	FkReferenceCount      pgtype.Int8
 }
@@ -1983,9 +2089,11 @@ func (q *Queries) SequenceHealth(ctx context.Context) ([]SequenceHealthRow, erro
 			&i.SequenceName,
 			&i.SeqDataType,
 			&i.CurrentValue,
+			&i.MinValue,
 			&i.MaxValue,
 			&i.IncrementBy,
 			&i.IsCyclic,
+			&i.IsUnreadable,
 			&i.RemainingValues,
 			&i.UsagePercent,
 			&i.TableName,
@@ -1993,7 +2101,7 @@ func (q *Queries) SequenceHealth(ctx context.Context) ([]SequenceHealthRow, erro
 			&i.ColumnType,
 			&i.ColumnMaxValue,
 			&i.SequenceExceedsColumn,
-			&i.ShouldBeBigint,
+			&i.ColumnUsagePercent,
 			&i.IsPrimaryKey,
 			&i.FkReferenceCount,
 		); err != nil {
@@ -2212,35 +2320,9 @@ func (q *Queries) SessionStatistics(ctx context.Context) (SessionStatisticsRow, 
 	return i, err
 }
 
-const statisticsFreshness = `-- name: StatisticsFreshness :one
-SELECT
-  stats_reset
-  , extract(EPOCH FROM (now() - stats_reset))::bigint AS age_seconds
-  , extract(EPOCH FROM (now() - pg_postmaster_start_time()))::bigint AS uptime_seconds
-FROM pg_stat_database
-WHERE datname = current_database()
-`
-
-type StatisticsFreshnessRow struct {
-	StatsReset    pgtype.Timestamptz
-	AgeSeconds    pgtype.Int8
-	UptimeSeconds pgtype.Int8
-}
-
-// Returns statistics age for the current database.
-// Only pg_stat_reset() records a timestamp; a crash or rebuilt replica zeroes the
-// counters silently, so uptime is the lower bound when stats_reset is NULL.
-func (q *Queries) StatisticsFreshness(ctx context.Context) (StatisticsFreshnessRow, error) {
-	row := q.db.QueryRow(ctx, statisticsFreshness)
-	var i StatisticsFreshnessRow
-	err := row.Scan(&i.StatsReset, &i.AgeSeconds, &i.UptimeSeconds)
-	return i, err
-}
-
 const tableActivity = `-- name: TableActivity :many
 SELECT
-  schemaname
-  , relname
+  (schemaname || '.' || relname)::text AS table_name
   , n_tup_ins
   , n_tup_upd
   , n_tup_del
@@ -2253,8 +2335,7 @@ ORDER BY n_tup_ins + n_tup_upd + n_tup_del DESC
 `
 
 type TableActivityRow struct {
-	Schemaname     pgtype.Text
-	Relname        pgtype.Text
+	TableName      pgtype.Text
 	NTupIns        pgtype.Int8
 	NTupUpd        pgtype.Int8
 	NTupDel        pgtype.Int8
@@ -2275,8 +2356,7 @@ func (q *Queries) TableActivity(ctx context.Context) ([]TableActivityRow, error)
 	for rows.Next() {
 		var i TableActivityRow
 		if err := rows.Scan(
-			&i.Schemaname,
-			&i.Relname,
+			&i.TableName,
 			&i.NTupIns,
 			&i.NTupUpd,
 			&i.NTupDel,
@@ -2296,7 +2376,7 @@ func (q *Queries) TableActivity(ctx context.Context) ([]TableActivityRow, error)
 
 const tableBloat = `-- name: TableBloat :many
 SELECT
-  (schemaname || '.' || relname)::text AS table_name
+  (schemaname || '.' || s.relname)::text AS table_name
   , n_live_tup AS live_tuples
   , n_dead_tup AS dead_tuples
   , last_autovacuum
@@ -2312,7 +2392,9 @@ SELECT
     ELSE 0
   END AS dead_tuple_percent
   , pg_total_relation_size(relid) AS total_size_bytes
-FROM pg_stat_user_tables
+  , NULLIF(c.relpages, 0)::bigint * current_setting('block_size')::bigint AS heap_size_bytes
+FROM pg_stat_user_tables AS s
+INNER JOIN pg_class AS c ON c.oid = s.relid
 WHERE
   schemaname NOT IN ('pg_catalog', 'information_schema')
   AND n_dead_tup > 1000  -- Ignore tiny tables with few dead tuples
@@ -2332,6 +2414,7 @@ type TableBloatRow struct {
 	ModificationsSinceAnalyze pgtype.Int8
 	DeadTuplePercent          pgtype.Numeric
 	TotalSizeBytes            pgtype.Int8
+	HeapSizeBytes             pgtype.Int8
 }
 
 // Identifies tables with high dead tuple percentages indicating vacuum issues
@@ -2357,6 +2440,7 @@ func (q *Queries) TableBloat(ctx context.Context) ([]TableBloatRow, error) {
 			&i.ModificationsSinceAnalyze,
 			&i.DeadTuplePercent,
 			&i.TotalSizeBytes,
+			&i.HeapSizeBytes,
 		); err != nil {
 			return nil, err
 		}
@@ -2391,8 +2475,10 @@ SELECT
   END AS cache_hit_ratio
 FROM pg_statio_user_tables AS psio
 INNER JOIN ranked ON psio.relid = ranked.relid
+INNER JOIN pg_class AS c ON psio.relid = c.oid
 WHERE
-  psio.schemaname = 'public'
+  psio.schemaname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+  AND c.relpersistence <> 't'
   -- rank<=20 rows bypass the size floor so the top-20 ranking is verifiable at --detail debug
   AND (pg_relation_size(psio.relid) >= 500 * 1024 * 1024 OR ranked.read_rank <= 20)
 ORDER BY pg_relation_size(psio.relid) DESC
@@ -2651,7 +2737,7 @@ type TableFreezeAgeRow struct {
 // Size avoids pg_total_relation_size(), whose AccessShareLock queues behind a
 // *waiting* AccessExclusiveLock and would time this check out during the DDL
 // pile-up it exists to diagnose. relpages is returned so relpages = 0 (never
-// vacuumed) renders as "unknown" rather than "0 B".
+// vacuumed) renders as "-" rather than "0B".
 // The worst member per counter, picked whole. Reporting max(age) against
 // min(trigger) as independent aggregates would pair one member's age with
 // another's trigger and fabricate a severity no relation has: a 390M/100M parent
@@ -2710,12 +2796,31 @@ SELECT
   -- *waiting* AccessExclusiveLock, so it makes this check time out during a DDL
   -- pile-up. relpages is only refreshed by VACUUM/ANALYZE, so it is stale by
   -- definition and 0 on a never-vacuumed relation.
-  , (c.relpages + COALESCE(t.relpages, 0) + COALESCE(i.index_pages, 0))::BIGINT
-    * CURRENT_SETTING('block_size')::BIGINT AS table_size_bytes
+  -- A partitioned parent has no storage, and ANALYZE sets its relpages to -1.
+  , CASE
+    WHEN c.relkind = 'r'
+      THEN (c.relpages::BIGINT + COALESCE(t.relpages::BIGINT, 0) + COALESCE(i.index_pages, 0))
+      * CURRENT_SETTING('block_size')::BIGINT
+  END AS table_size_bytes
   , COALESCE(s.n_dead_tup, 0) AS n_dead_tup
   , COALESCE(s.vacuum_count, 0) AS vacuum_count
   , COALESCE(s.autovacuum_count, 0) AS autovacuum_count
   , ARRAY_TO_STRING(c.reloptions, ',') AS reloptions
+  , EXISTS (
+    SELECT 1
+    FROM PG_OPTIONS_TO_TABLE(c.reloptions) AS o
+    WHERE o.option_name = 'autovacuum_enabled' AND NOT o.option_value::boolean
+  ) AS autovacuum_disabled
+  , av.scale_factor AS vacuum_scale_factor
+  -- autovacuum_vacuum_max_threshold is PG18+; -1 disables the cap.
+  -- Autovacuum never processes a partitioned parent, so it has no trigger.
+  , CASE
+    WHEN c.relkind = 'r'
+      THEN LEAST(
+        av.threshold + av.scale_factor * GREATEST(c.reltuples, 0)
+        , NULLIF(av.max_threshold, -1)
+      )::bigint
+  END AS vacuum_trigger
   -- NULL means never.
   , EXTRACT(EPOCH FROM (now() - GREATEST(s.last_vacuum, s.last_autovacuum)))::bigint AS last_vacuum_age_seconds
   , EXTRACT(EPOCH FROM (now() - GREATEST(s.last_analyze, s.last_autoanalyze)))::bigint AS last_analyze_age_seconds
@@ -2734,9 +2839,26 @@ LEFT JOIN LATERAL (
   INNER JOIN pg_class AS ic ON ic.oid = x.indexrelid
   WHERE x.indrelid IN (c.oid, c.reltoastrelid)
 ) AS i ON TRUE
+LEFT JOIN LATERAL (
+  SELECT
+    COALESCE(
+      MAX(o.option_value) FILTER (WHERE o.option_name = 'autovacuum_vacuum_scale_factor')
+      , CURRENT_SETTING('autovacuum_vacuum_scale_factor')
+    )::float8 AS scale_factor
+    , COALESCE(
+      MAX(o.option_value) FILTER (WHERE o.option_name = 'autovacuum_vacuum_threshold')
+      , CURRENT_SETTING('autovacuum_vacuum_threshold')
+    )::float8::bigint AS threshold
+    , COALESCE(
+      MAX(o.option_value) FILTER (WHERE o.option_name = 'autovacuum_vacuum_max_threshold')
+      , CURRENT_SETTING('autovacuum_vacuum_max_threshold', TRUE)
+    )::float8::bigint AS max_threshold
+  FROM PG_OPTIONS_TO_TABLE(c.reloptions) AS o
+) AS av ON TRUE
 WHERE
   c.relkind IN ('r', 'p')
-  AND n.nspname = 'public'
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+  AND c.relpersistence <> 't'
 ORDER BY COALESCE(s.n_live_tup, c.reltuples::bigint) DESC
 `
 
@@ -2749,6 +2871,9 @@ type TableVacuumHealthRow struct {
 	VacuumCount           pgtype.Int8
 	AutovacuumCount       pgtype.Int8
 	Reloptions            pgtype.Text
+	AutovacuumDisabled    pgtype.Bool
+	VacuumScaleFactor     pgtype.Float8
+	VacuumTrigger         pgtype.Int8
 	LastVacuumAgeSeconds  pgtype.Int8
 	LastAnalyzeAgeSeconds pgtype.Int8
 	NModSinceAnalyze      pgtype.Int8
@@ -2757,7 +2882,7 @@ type TableVacuumHealthRow struct {
 	NInsSinceVacuum       pgtype.Int8
 }
 
-// Returns all tables with vacuum-related health metrics.
+// Returns all tables with vacuum-related health metrics. Excludes: system schemas and temporary tables.
 // Used by subchecks: autovacuum-disabled, large-table-defaults, vacuum-stale.
 func (q *Queries) TableVacuumHealth(ctx context.Context) ([]TableVacuumHealthRow, error) {
 	rows, err := q.db.Query(ctx, tableVacuumHealth)
@@ -2777,6 +2902,9 @@ func (q *Queries) TableVacuumHealth(ctx context.Context) ([]TableVacuumHealthRow
 			&i.VacuumCount,
 			&i.AutovacuumCount,
 			&i.Reloptions,
+			&i.AutovacuumDisabled,
+			&i.VacuumScaleFactor,
+			&i.VacuumTrigger,
 			&i.LastVacuumAgeSeconds,
 			&i.LastAnalyzeAgeSeconds,
 			&i.NModSinceAnalyze,
@@ -3032,7 +3160,7 @@ WITH toast_info AS (
   FROM pg_class AS c
   INNER JOIN pg_namespace AS n ON c.relnamespace = n.oid
   INNER JOIN pg_class AS t ON c.reltoastrelid = t.oid
-  LEFT JOIN pg_stat_user_tables AS st ON t.oid = st.relid
+  LEFT JOIN pg_stat_all_tables AS st ON t.oid = st.relid
   WHERE
     c.relkind IN ('r', 'p')
     AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
@@ -3146,30 +3274,48 @@ func (q *Queries) ToastStorage(ctx context.Context) ([]ToastStorageRow, error) {
 }
 
 const uuidColumnDefaults = `-- name: UuidColumnDefaults :many
-WITH indexed_columns AS (
+WITH RECURSIVE tree AS (
   SELECT
-    i.indrelid AS table_oid
-    , unnest(i.indkey) AS column_num
-  FROM pg_index AS i
+    c.oid AS root
+    , c.oid AS relid
+  FROM pg_class AS c
+  WHERE c.relkind IN ('r', 'p') AND NOT c.relispartition
+  UNION ALL
+  SELECT
+    tree.root
+    , inh.inhrelid
+  FROM tree
+  INNER JOIN pg_inherits AS inh ON tree.relid = inh.inhparent
+  INNER JOIN pg_class AS pc ON inh.inhrelid = pc.oid AND pc.relispartition
+)
+
+, indexed AS (
+  SELECT DISTINCT
+    tree.root
+    , ia.attname
+  FROM tree
+  INNER JOIN pg_index AS i ON tree.relid = i.indrelid
+  INNER JOIN pg_attribute AS ia
+    ON i.indrelid = ia.attrelid AND ia.attnum = ANY(i.indkey)
 )
 
 SELECT
   (n.nspname || '.' || c.relname)::text AS table_name
   , a.attname::text AS column_name
   , pg_get_expr(d.adbin, d.adrelid)::text AS default_expr
-  , (idx.column_num IS NOT NULL) AS has_index
+  , (ix.root IS NOT NULL) AS has_index
 FROM pg_attribute AS a
 INNER JOIN pg_class AS c ON a.attrelid = c.oid
 INNER JOIN pg_namespace AS n ON c.relnamespace = n.oid
 INNER JOIN pg_type AS t ON a.atttypid = t.oid
 LEFT JOIN pg_attrdef AS d ON c.oid = d.adrelid AND a.attnum = d.adnum
-LEFT JOIN indexed_columns AS idx
-  ON c.oid = idx.table_oid AND a.attnum = idx.column_num
+LEFT JOIN indexed AS ix ON c.oid = ix.root AND a.attname = ix.attname
 WHERE
   a.attnum > 0
   AND NOT a.attisdropped
   AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
   AND c.relkind IN ('r', 'p')
+  AND NOT c.relispartition
   AND t.typname = 'uuid'
   AND d.adbin IS NOT NULL
 `
@@ -3182,6 +3328,8 @@ type UuidColumnDefaultsRow struct {
 }
 
 // Find UUID columns with their DEFAULT expressions to detect random UUID usage.
+// A partitioned table reports once, indexed if an index on the root or any partition covers the column.
+// pg_inherits instead of pg_partition_tree(), which locks every partition.
 func (q *Queries) UuidColumnDefaults(ctx context.Context) ([]UuidColumnDefaultsRow, error) {
 	rows, err := q.db.Query(ctx, uuidColumnDefaults)
 	if err != nil {

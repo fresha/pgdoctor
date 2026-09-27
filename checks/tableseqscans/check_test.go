@@ -3,11 +3,13 @@ package tableseqscans_test
 import (
 	"context"
 	"fmt"
+	"math"
 	"testing"
 
 	"github.com/fresha/pgdoctor/check"
 	"github.com/fresha/pgdoctor/checks/tableseqscans"
 	"github.com/fresha/pgdoctor/db"
+	"github.com/fresha/pgdoctor/internal/checktest"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/stretchr/testify/require"
 )
@@ -18,11 +20,13 @@ const (
 )
 
 type mockTableSeqScansQueryer struct {
-	rows []db.HighSeqScanTablesRow
-	err  error
+	rows    []db.HighSeqScanTablesRow
+	err     error
+	minRows int64
 }
 
-func (m *mockTableSeqScansQueryer) HighSeqScanTables(context.Context) ([]db.HighSeqScanTablesRow, error) {
+func (m *mockTableSeqScansQueryer) HighSeqScanTables(_ context.Context, minRows int64) ([]db.HighSeqScanTablesRow, error) {
+	m.minRows = minRows
 	if m.err != nil {
 		return nil, m.err
 	}
@@ -74,7 +78,7 @@ func Test_TableSeqScans(t *testing.T) {
 				},
 			},
 			ExpectedSeverity: check.SeverityWarn,
-			ExpectedFindings: 1,
+			ExpectedFindings: 2,
 		},
 		{
 			Name: "high seq scans (>50k rows, >50 ratio) - FAIL",
@@ -141,7 +145,7 @@ func Test_TableSeqScans(t *testing.T) {
 
 			queryer := newMockQueryer(tc.Rows)
 
-			checker := tableseqscans.New(queryer)
+			checker := tableseqscans.New(queryer, tableseqscans.DefaultConfig())
 			report, err := checker.Check(context.Background())
 			require.NoError(t, err)
 
@@ -179,7 +183,7 @@ func Test_TableSeqScans_HighSeqScans(t *testing.T) {
 
 	queryer := newMockQueryer(rows)
 
-	checker := tableseqscans.New(queryer)
+	checker := tableseqscans.New(queryer, tableseqscans.DefaultConfig())
 	report, err := checker.Check(context.Background())
 	require.NoError(t, err)
 
@@ -194,10 +198,40 @@ func Test_TableSeqScans_HighSeqScans(t *testing.T) {
 	require.NotNil(t, highSeqResult, "Should have high-seq-scans finding")
 	require.Equal(t, check.SeverityFail, highSeqResult.Severity)
 	require.Contains(t, highSeqResult.Details, "2 tables")
-	require.Contains(t, highSeqResult.Details, "orders")
-	require.Contains(t, highSeqResult.Details, "seq: 10000")
-	require.Contains(t, highSeqResult.Details, "idx: 100")
-	require.Contains(t, highSeqResult.Details, "ratio: 100.0")
+	require.Equal(t, []string{"Table", "Seq Scans", "Idx Scans", "Ratio", "Rows", "Size"}, highSeqResult.Table.Headers)
+	require.Len(t, highSeqResult.Table.Rows, 2)
+	require.Equal(t, []string{"orders", "10.0K", "100", "100.0", "75.0K", "75.0MiB"}, highSeqResult.Table.Rows[0].Cells)
+	require.Equal(t, check.SeverityFail, highSeqResult.Table.Rows[0].Severity)
+}
+
+func Test_TableSeqScans_SameNameInTwoSchemas(t *testing.T) {
+	t.Parallel()
+
+	tenantTable := func(name string) db.HighSeqScanTablesRow {
+		return db.HighSeqScanTablesRow{
+			TableName:      pgtype.Text{String: name, Valid: true},
+			SeqScan:        pgtype.Int8{Int64: 10000, Valid: true},
+			IdxScan:        pgtype.Int8{Int64: 100, Valid: true},
+			SeqToIdxRatio:  makeNumeric(100.0),
+			EstimatedRows:  pgtype.Int8{Int64: 75000, Valid: true},
+			TableSizeBytes: pgtype.Int8{Int64: 78643200, Valid: true},
+			IndexCount:     pgtype.Int8{Int64: 3, Valid: true},
+		}
+	}
+
+	queryer := newMockQueryer([]db.HighSeqScanTablesRow{tenantTable("tenant_a.orders"), tenantTable("tenant_b.orders")})
+
+	report, err := tableseqscans.New(queryer, tableseqscans.DefaultConfig()).Check(context.Background())
+	require.NoError(t, err)
+	checktest.AssertSeverityInvariant(t, report)
+
+	require.Len(t, report.Results, 1)
+	result := report.Results[0]
+	require.Equal(t, highSeqScansID, result.ID)
+	require.Equal(t, check.SeverityFail, result.Severity)
+	require.Contains(t, result.Details, "2 tables")
+	require.Equal(t, "tenant_a.orders", result.Table.Rows[0].Cells[0])
+	require.Equal(t, "tenant_b.orders", result.Table.Rows[1].Cells[0])
 }
 
 func Test_TableSeqScans_ModerateSeqScans(t *testing.T) {
@@ -217,7 +251,7 @@ func Test_TableSeqScans_ModerateSeqScans(t *testing.T) {
 
 	queryer := newMockQueryer(rows)
 
-	checker := tableseqscans.New(queryer)
+	checker := tableseqscans.New(queryer, tableseqscans.DefaultConfig())
 	report, err := checker.Check(context.Background())
 	require.NoError(t, err)
 
@@ -231,7 +265,10 @@ func Test_TableSeqScans_ModerateSeqScans(t *testing.T) {
 
 	require.NotNil(t, moderateSeqResult, "Should have moderate-seq-scans finding")
 	require.Equal(t, check.SeverityWarn, moderateSeqResult.Severity)
-	require.Contains(t, moderateSeqResult.Details, "comments")
+	require.Equal(t, "comments", moderateSeqResult.Table.Rows[0].Cells[0])
+	require.Equal(t, check.SeverityWarn, moderateSeqResult.Table.Rows[0].Severity)
+	require.Equal(t, check.SeverityWarn, report.Severity)
+	checktest.AssertSeverityInvariant(t, report)
 }
 
 func Test_TableSeqScans_ThresholdBoundaries(t *testing.T) {
@@ -289,7 +326,7 @@ func Test_TableSeqScans_ThresholdBoundaries(t *testing.T) {
 
 			queryer := newMockQueryer(rows)
 
-			checker := tableseqscans.New(queryer)
+			checker := tableseqscans.New(queryer, tableseqscans.DefaultConfig())
 			report, err := checker.Check(context.Background())
 			require.NoError(t, err)
 
@@ -326,7 +363,7 @@ func Test_TableSeqScans_NoIndexCount(t *testing.T) {
 
 	queryer := newMockQueryer(rows)
 
-	checker := tableseqscans.New(queryer)
+	checker := tableseqscans.New(queryer, tableseqscans.DefaultConfig())
 	report, err := checker.Check(context.Background())
 	require.NoError(t, err)
 
@@ -354,7 +391,7 @@ func Test_TableSeqScans_InvalidRatio(t *testing.T) {
 
 	queryer := newMockQueryer(rows)
 
-	checker := tableseqscans.New(queryer)
+	checker := tableseqscans.New(queryer, tableseqscans.DefaultConfig())
 	report, err := checker.Check(context.Background())
 	require.NoError(t, err)
 
@@ -367,7 +404,8 @@ func Test_TableSeqScans_InvalidRatio(t *testing.T) {
 	}
 
 	require.NotNil(t, highSeqResult)
-	require.Equal(t, check.SeverityFail, highSeqResult.Severity, "Invalid ratio (no idx scans) should be treated as very high")
+	require.Equal(t, check.SeverityFail, highSeqResult.Severity, "No index scans should meet any ratio threshold")
+	require.Equal(t, "no index scans", highSeqResult.Table.Rows[0].Cells[3])
 }
 
 func Test_TableSeqScans_SizeFormatting(t *testing.T) {
@@ -387,7 +425,7 @@ func Test_TableSeqScans_SizeFormatting(t *testing.T) {
 
 	queryer := newMockQueryer(rows)
 
-	checker := tableseqscans.New(queryer)
+	checker := tableseqscans.New(queryer, tableseqscans.DefaultConfig())
 	report, err := checker.Check(context.Background())
 	require.NoError(t, err)
 
@@ -400,10 +438,10 @@ func Test_TableSeqScans_SizeFormatting(t *testing.T) {
 	}
 
 	require.NotNil(t, highSeqResult)
-	require.Contains(t, highSeqResult.Details, "100.0 MB", "Should format size as MB")
+	require.Equal(t, "100.0MiB", highSeqResult.Table.Rows[0].Cells[5])
 }
 
-func Test_TableSeqScans_TruncationMessage(t *testing.T) {
+func Test_TableSeqScans_ListsEveryTable(t *testing.T) {
 	t.Parallel()
 
 	rows := make([]db.HighSeqScanTablesRow, 15)
@@ -421,7 +459,7 @@ func Test_TableSeqScans_TruncationMessage(t *testing.T) {
 
 	queryer := newMockQueryer(rows)
 
-	checker := tableseqscans.New(queryer)
+	checker := tableseqscans.New(queryer, tableseqscans.DefaultConfig())
 	report, err := checker.Check(context.Background())
 	require.NoError(t, err)
 
@@ -434,7 +472,8 @@ func Test_TableSeqScans_TruncationMessage(t *testing.T) {
 	}
 
 	require.NotNil(t, highSeqResult)
-	require.Contains(t, highSeqResult.Details, "... and 5 more", "Should show truncation message")
+	require.Equal(t, "Found 15 tables with very high sequential scan ratios", highSeqResult.Details)
+	require.Len(t, highSeqResult.Table.Rows, 15)
 }
 
 func Test_TableSeqScans_QueryError(t *testing.T) {
@@ -443,7 +482,7 @@ func Test_TableSeqScans_QueryError(t *testing.T) {
 	expectedErr := fmt.Errorf("database connection error")
 	queryer := newMockQueryerWithError(expectedErr)
 
-	checker := tableseqscans.New(queryer)
+	checker := tableseqscans.New(queryer, tableseqscans.DefaultConfig())
 	_, err := checker.Check(context.Background())
 
 	require.Error(t, err, "Should return error when query fails")
@@ -454,7 +493,7 @@ func Test_TableSeqScans_Metadata(t *testing.T) {
 	t.Parallel()
 
 	queryer := newMockQueryer([]db.HighSeqScanTablesRow{})
-	checker := tableseqscans.New(queryer)
+	checker := tableseqscans.New(queryer, tableseqscans.DefaultConfig())
 	metadata := checker.Metadata()
 
 	require.Equal(t, "table-seq-scans", metadata.CheckID, "CheckID should match")
@@ -470,7 +509,7 @@ func Test_TableSeqScans_OKResult(t *testing.T) {
 
 	queryer := newMockQueryer([]db.HighSeqScanTablesRow{})
 
-	checker := tableseqscans.New(queryer)
+	checker := tableseqscans.New(queryer, tableseqscans.DefaultConfig())
 	report, err := checker.Check(context.Background())
 	require.NoError(t, err)
 
@@ -500,7 +539,7 @@ func Test_TableSeqScans_NoOKResultWhenIssuesFound(t *testing.T) {
 
 	queryer := newMockQueryer(rows)
 
-	checker := tableseqscans.New(queryer)
+	checker := tableseqscans.New(queryer, tableseqscans.DefaultConfig())
 	report, err := checker.Check(context.Background())
 	require.NoError(t, err)
 
@@ -510,4 +549,105 @@ func Test_TableSeqScans_NoOKResultWhenIssuesFound(t *testing.T) {
 	result := results[0]
 	require.Equal(t, "high-seq-scans", result.ID)
 	require.Equal(t, check.SeverityFail, result.Severity)
+}
+
+func Test_TableSeqScans_Config(t *testing.T) {
+	t.Parallel()
+
+	table := func(rows int64, ratio float64) db.HighSeqScanTablesRow {
+		return db.HighSeqScanTablesRow{
+			TableName:      pgtype.Text{String: "orders", Valid: true},
+			SeqScan:        pgtype.Int8{Int64: 10000, Valid: true},
+			IdxScan:        pgtype.Int8{Int64: 100, Valid: true},
+			SeqToIdxRatio:  makeNumeric(ratio),
+			EstimatedRows:  pgtype.Int8{Int64: rows, Valid: true},
+			TableSizeBytes: pgtype.Int8{Int64: 10485760, Valid: true},
+			IndexCount:     pgtype.Int8{Int64: 2, Valid: true},
+		}
+	}
+
+	tests := []struct {
+		name            string
+		cfg             tableseqscans.Config
+		row             db.HighSeqScanTablesRow
+		wantMinRows     int64
+		wantHighFinding check.Severity
+	}{
+		{
+			name:            "defaults",
+			cfg:             tableseqscans.DefaultConfig(),
+			row:             table(50000, 50),
+			wantMinRows:     10000,
+			wantHighFinding: check.SeverityFail,
+		},
+		{
+			name:            "higher min rows moves the table out of high",
+			cfg:             tableseqscans.Config{HighSeqScansMinRows: 50001, HighSeqScansMinRatio: 50},
+			row:             table(50000, 50),
+			wantMinRows:     10000,
+			wantHighFinding: check.SeverityPass,
+		},
+		{
+			name:            "min rows below the moderate floor lowers the query floor",
+			cfg:             tableseqscans.Config{HighSeqScansMinRows: 5000, HighSeqScansMinRatio: 50},
+			row:             table(5000, 50),
+			wantMinRows:     5000,
+			wantHighFinding: check.SeverityFail,
+		},
+		{
+			name:            "lower min ratio",
+			cfg:             tableseqscans.Config{HighSeqScansMinRows: 50000, HighSeqScansMinRatio: 2.5},
+			row:             table(50000, 2.5),
+			wantMinRows:     10000,
+			wantHighFinding: check.SeverityFail,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			queryer := newMockQueryer([]db.HighSeqScanTablesRow{tt.row})
+			report, err := tableseqscans.New(queryer, tt.cfg).Check(context.Background())
+			require.NoError(t, err)
+			checktest.AssertSeverityInvariant(t, report)
+
+			require.Equal(t, tt.wantMinRows, queryer.minRows)
+			require.Equal(t, highSeqScansID, report.Results[0].ID)
+			require.Equal(t, tt.wantHighFinding, report.Results[0].Severity)
+		})
+	}
+}
+
+func Test_TableSeqScans_ConfigValidate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		rows    int64
+		ratio   float64
+		wantErr bool
+	}{
+		{name: "defaults", rows: 50000, ratio: 50},
+		{name: "fractional ratio", rows: 50000, ratio: 2.5},
+		{name: "zero rows", rows: 0, ratio: 50, wantErr: true},
+		{name: "negative rows", rows: -5, ratio: 50, wantErr: true},
+		{name: "zero ratio", rows: 50000, ratio: 0, wantErr: true},
+		{name: "negative ratio", rows: 50000, ratio: -1, wantErr: true},
+		{name: "NaN ratio", rows: 50000, ratio: math.NaN(), wantErr: true},
+		{name: "infinite ratio", rows: 50000, ratio: math.Inf(1), wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := tableseqscans.Config{HighSeqScansMinRows: tt.rows, HighSeqScansMinRatio: tt.ratio}.Validate()
+			if tt.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
 }

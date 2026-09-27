@@ -42,11 +42,11 @@ Durable pins on the xmin horizon: a replication slot's `xmin`/`catalog_xmin`, or
 | Pin age | `1x autovacuum_freeze_max_age` | `min(4x trigger, vacuum_failsafe_age)` |
 | Inactive slot | `wal_status` `reserved`/`extended` and pin age >= 1M | `wal_status` `unreserved` or `lost`, at any pin age |
 
-A pin warns at `1x`, one sawtooth period before the age itself warns, because from there every anti-wraparound vacuum is guaranteed to complete without freezing past it. An active slot holding a recent xmin is normal CDC operation and passes at any recency. Coincidence, a pin within `max(10M, 5% of trigger)` of the database age, decides the message and not the severity: a level pin is what the age is waiting on, and no level pin means the age is autovacuum throughput. Backends, idle-in-transaction sessions and lock waiters are absent on purpose: reading them needs luck in timing, so they belong to `houston dba xmin`.
+A pin warns at `1x`, one sawtooth period before the age itself warns, because from there every anti-wraparound vacuum is guaranteed to complete without freezing past it. An active slot holding a recent xmin is normal CDC operation. Coincidence, a pin within `max(10M, 5% of trigger)` of the database age, decides the message and not the severity: a level pin is what the age is waiting on, and no level pin means the age is autovacuum throughput. Backends, idle-in-transaction sessions and lock waiters are absent on purpose: reading them needs luck in timing, so they belong to `houston dba xmin`.
 
 ## Statistics Requirements
 
-`Last Vacuum` comes from `pg_stat_all_tables`, so it is only as trustworthy as the statistics window; run `statistics-freshness` before relying on it. The ages come from `pg_class` and `pg_database` and are exact.
+`Last Vacuum` comes from `pg_stat_all_tables`, so it is only as trustworthy as the statistics window; run `db-statistics` before relying on it. The ages come from `pg_class` and `pg_database` and are exact.
 
 ## How to Fix
 
@@ -65,9 +65,13 @@ VACUUM (FREEZE, VERBOSE) public.bookings;   -- processes its TOAST relation too
 
 Many targets at once is autovacuum throughput rather than a per-table problem: raise `autovacuum_max_workers` and `autovacuum_vacuum_cost_limit`, drop `autovacuum_vacuum_cost_delay`, then `SELECT pg_reload_conf()`. Lowering a relation's trigger freezes it earlier and more often, but creates no headroom on its own and does nothing while a pin holds the horizon.
 
-### For `database-multixact-age` and `table-multixact-age`
+### For `database-multixact-age`
 
-Same remediation, since a `VACUUM (FREEZE)` advances both counters. Tune against `autovacuum_multixact_freeze_max_age`, and cut MultiXact generation by reducing concurrent `FOR KEY SHARE` lockers on one hot parent row.
+The database MultiXact age is the maximum over its relations, so fix the relations under `table-multixact-age`.
+
+### For `table-multixact-age`
+
+Same remediation as `table-freeze-age`, since a `VACUUM (FREEZE)` advances both counters. Tune against `autovacuum_multixact_freeze_max_age`, and cut MultiXact generation by reducing concurrent `FOR KEY SHARE` lockers on one hot parent row.
 
 ### For `horizon-pin`
 
@@ -75,7 +79,7 @@ Advance or remove the single object the finding names, one command at a time: `S
 
 ## Notes
 
-- `Size (est)` is a lock-free `relpages` estimate. `pg_total_relation_size()` takes an `AccessShareLock` that queues behind waiting DDL and would time this check out during a lock pile-up. It is stale until the next `VACUUM`/`ANALYZE`, and `unknown` when `relpages` is 0.
+- `Size (est)` is a lock-free `relpages` estimate. `pg_total_relation_size()` takes an `AccessShareLock` that queues behind waiting DDL and would time this check out during a lock pile-up. It is stale until the next `VACUUM`/`ANALYZE`, and `-` when `relpages` is 0.
 - Anti-wraparound vacuum is exempt from the lock-conflict auto-cancel a normal autovacuum obeys, so a queued `ALTER TABLE` turns it into a table lockout. `autovacuum_enabled = false` does not prevent it.
 - PostgreSQL 14 is the floor, because `vacuum_failsafe_age` and `vacuum_multixact_failsafe_age` were added there. `horizon-pin` never reads `inactive_since` (PG17+), so slot recency is the age of the pinned xid.
 

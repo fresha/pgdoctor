@@ -5,6 +5,7 @@
 A command-line tool and Go library for running health checks against PostgreSQL databases.
 It identifies misconfigurations, performance issues, and areas for optimization through
 read-only checks that are safe to run against production.
+It supports PostgreSQL 14 and newer.
 
 <br clear="left" />
 
@@ -57,6 +58,8 @@ pgdoctor run "postgres://..." --help
 
 Run health checks against a PostgreSQL database. The DSN can be passed as a positional argument or via the `PGDOCTOR_DSN` environment variable.
 
+pgdoctor always uses a connect timeout. When the DSN sets no positive `connect_timeout`, the timeout is 10 seconds. When the DSN sets no `application_name`, pgdoctor uses `pgdoctor`, so you can find its session in `pg_stat_activity`. A value in the DSN wins.
+
 | Flag | Description |
 |------|-------------|
 | `--only` | Only run these checks or categories |
@@ -64,9 +67,41 @@ Run health checks against a PostgreSQL database. The DSN can be passed as a posi
 | `--preset` | Check preset: `all` (default), `triage` |
 | `--detail` | Detail level: `summary`, `brief` (default), `verbose`, `debug` |
 | `--output` | Output format: `text` (default), `json` |
-| `--hide-passing` | Hide passing checks |
+| `--hide-passing` | Hide checks and findings that passed |
+| `--config` | YAML file with per-check settings, keyed by check ID |
 
-Exit codes: `0` = all checks pass, `1` = failures found, `2` = connection error.
+`--only` and `--ignore` accept a check ID with or without its category, so the IDs that `pgdoctor list` prints work as they are: `--only configs/pg-version` is the same as `--only pg-version`.
+
+A preset other than `all` takes precedence over `--only`: pgdoctor ignores `--only` and prints a warning to stderr. `--ignore` still removes checks from the preset. For an unknown preset, pgdoctor prints a warning that names the valid presets and uses `all`.
+
+A config file changes the settings of a check. Each check README lists the keys it reads. A key that is not in the file keeps its default value:
+
+```yaml
+session-settings:
+  ignore_roles: [migrations]
+  timeout: 5000
+  timeout_by_role:
+    dba_ro: 300000
+```
+
+An error in the config file stops pgdoctor with exit code `2` before it runs a query. pgdoctor prints every error to stderr. These are errors:
+
+- an unknown check ID
+- a key that the check does not read, at any depth
+- a value of the wrong type, for example `timeout: 5s`, or a comma-separated string where the check reads a list
+- a value that the check rejects, for example a WARN threshold that is not lower than the FAIL threshold
+
+The error messages do not show line numbers, because pgdoctor decodes each check section separately.
+
+Exit codes are the same for text and JSON output:
+
+| Code | Meaning |
+|------|---------|
+| `0` | The checks ran. No check reported FAIL. |
+| `1` | The checks ran. At least one check reported FAIL. |
+| `2` | pgdoctor could not run: connection error, usage error, bad `--config`, unknown flag value, or zero checks selected. |
+
+A usage error is an unknown flag, too many arguments, or an unknown `--only` or `--ignore` value.
 
 ### `pgdoctor list`
 
@@ -102,14 +137,13 @@ pgdoctor completion bash > /etc/bash_completion.d/pgdoctor
 |-------|-------------|
 | `pg-version` | PostgreSQL version support status |
 | `session-settings` | Role-level timeout and logging configurations |
-| `vacuum-settings` | Autovacuum, maintenance memory, and vacuum cost settings |
 | `replication-slots` | Replication slot configuration and health |
 | `connection-health` | Connection pool saturation, idle ratios, stuck transactions |
 | `connection-efficiency` | Session statistics for connection pool efficiency (PG 14+) |
-| `replication-lag` | Active replication stream lag |
 | `temp-usage` | Temporary file creation indicating `work_mem` exhaustion |
-| `statistics-freshness` | Statistics maturity for usage-based analysis |
+| `db-statistics` | Statistics maturity for usage-based analysis |
 | `query-stats-capacity` | `pg_stat_statements` entry usage and eviction rate |
+| `extension-versions` | Installed extension versions no longer supported upstream |
 
 ### indexes
 | Check | Description |
@@ -125,13 +159,13 @@ pgdoctor completion bash > /etc/bash_completion.d/pgdoctor
 | `freeze-age` | Transaction ID age approaching wraparound |
 | `table-bloat` | Dead tuple percentages indicating vacuum issues |
 | `table-vacuum-health` | Per-table autovacuum configuration and activity |
+| `vacuum-settings` | Autovacuum, maintenance memory, and vacuum cost settings |
 
 ### schema
 | Check | Description |
 |-------|-------------|
 | `pk-types` | Primary keys using bigint or UUID for growth capacity |
 | `uuid-types` | UUID columns using native `uuid` type vs varchar/text |
-| `uuid-defaults` | UUID columns using v4 random defaults (B-tree bloat) |
 | `sequence-health` | Sequences approaching exhaustion |
 | `toast-storage` | TOAST storage usage optimization |
 | `partitioning` | Large/transient tables needing partitioning |
@@ -143,6 +177,8 @@ pgdoctor completion bash > /etc/bash_completion.d/pgdoctor
 | `table-seq-scans` | Tables with excessive sequential scans |
 | `partition-usage` | Queries not using partition keys |
 | `table-activity` | Table write activity and HOT update efficiency |
+| `replication-lag` | Active replication stream lag |
+| `uuid-defaults` | UUID columns using v4 random defaults (B-tree bloat) |
 
 ## Using as a Library
 
@@ -156,6 +192,7 @@ import (
     "fmt"
 
     "github.com/fresha/pgdoctor"
+    "github.com/fresha/pgdoctor/check"
     "github.com/jackc/pgx/v5"
 )
 
@@ -165,6 +202,7 @@ func main() {
     defer conn.Close(ctx)
 
     pgdoctor.Run(ctx, conn, pgdoctor.Options{
+        Checks: pgdoctor.AllChecks(),
         OnReport: func(report *check.Report) {
             fmt.Printf("[%s] %s\n", report.CheckID, report.Name)
         },
@@ -186,6 +224,21 @@ pgdoctor.AllChecks() []check.Package
 
 // Validate filter strings against a check set
 pgdoctor.ValidateFilters(checks, filters) (valid, invalid []string)
+```
+
+To change the settings of a check, put the `Config` value of that check in `Options.Config`, keyed by check ID. Start from `DefaultConfig()`, because a zero field is not a valid setting. A check with an invalid value, or a value of the wrong type, reports SKIP with the reason:
+
+```go
+lag := replicationlag.DefaultConfig()
+lag.PhysicalLagWarnSeconds = 10
+
+pgdoctor.Run(ctx, conn, pgdoctor.Options{
+    Checks: pgdoctor.AllChecks(),
+    Config: check.Config{
+        "replication-lag":  lag,
+        "session-settings": sessionsettings.Config{Timeout: 2000},
+    },
+})
 ```
 
 The `db.DBTX` interface matches `pgx.Conn`, so pgdoctor works with any pgx-compatible connection.

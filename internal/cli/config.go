@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"sort"
@@ -21,9 +23,13 @@ func loadConfig(path string, checks []check.Package) (check.Config, error) {
 		return nil, fmt.Errorf("reading config: %w", err)
 	}
 
+	dec := yaml.NewDecoder(bytes.NewReader(data))
 	var raw map[string]yaml.Node
-	if err := yaml.Unmarshal(data, &raw); err != nil {
+	if err := dec.Decode(&raw); err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("parsing config %s: %w", path, err)
+	}
+	if err := dec.Decode(&yaml.Node{}); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("parsing config %s: expected one YAML document", path)
 	}
 
 	known := map[string]check.Package{}
@@ -40,12 +46,26 @@ func loadConfig(path string, checks []check.Package) (check.Config, error) {
 			continue
 		}
 		if pkg.DecodeConfig == nil {
-			if node.Kind != yaml.MappingNode || len(node.Content) > 0 {
+			var settings map[string]any
+			if err := node.Decode(&settings); err != nil || len(settings) > 0 {
 				problems = append(problems, fmt.Sprintf("%s: the check accepts no settings", checkID))
 			}
 			continue
 		}
-		settings, err := yaml.Marshal(&node)
+		// Decode rejects an anchor that contains itself and excessive aliasing, but it
+		// skips a merged key that an explicit key overrides, so resolveAliases keeps
+		// its own limit.
+		if err := node.Decode(new(any)); err != nil {
+			problems = append(problems, fmt.Sprintf("%s: %v", checkID, err))
+			continue
+		}
+		expanded := 0
+		resolved, err := resolveAliases(&node, false, &expanded)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("%s: %v", checkID, err))
+			continue
+		}
+		settings, err := yaml.Marshal(resolved)
 		if err != nil {
 			problems = append(problems, fmt.Sprintf("%s: %v", checkID, err))
 			continue
@@ -60,7 +80,9 @@ func loadConfig(path string, checks []check.Package) (check.Config, error) {
 			continue
 		}
 		if err != nil {
-			problems = append(problems, fmt.Sprintf("%s: %v", checkID, err))
+			for _, msg := range strings.Split(err.Error(), "\n") {
+				problems = append(problems, fmt.Sprintf("%s: %s", checkID, msg))
+			}
 			continue
 		}
 		cfg[checkID] = value
@@ -70,4 +92,32 @@ func loadConfig(path string, checks []check.Package) (check.Config, error) {
 		return nil, fmt.Errorf("invalid config %s:\n  %s", path, strings.Join(problems, "\n  "))
 	}
 	return cfg, nil
+}
+
+// maxAliasNodes bounds the nodes that alias expansion reaches in one check
+// section. A cycle or an alias bomb never finishes without it.
+const maxAliasNodes = 10000
+
+// resolveAliases returns a copy of n in which each alias is replaced by its
+// anchor. It never changes n, because check sections share the nodes of an anchor.
+func resolveAliases(n *yaml.Node, inAlias bool, expanded *int) (*yaml.Node, error) {
+	if n.Kind == yaml.AliasNode {
+		n = n.Alias
+		inAlias = true
+	}
+	if inAlias {
+		*expanded++
+		if *expanded > maxAliasNodes {
+			return nil, errors.New("YAML aliases expand too far (an alias cycle or too many aliases)")
+		}
+	}
+	resolved := *n
+	resolved.Content = make([]*yaml.Node, len(n.Content))
+	for i, child := range n.Content {
+		var err error
+		if resolved.Content[i], err = resolveAliases(child, inAlias, expanded); err != nil {
+			return nil, err
+		}
+	}
+	return &resolved, nil
 }

@@ -406,6 +406,25 @@ If a check doesn't appear in `list` or `explain`:
 3. Verify check directory is in `sqlc.yaml`
 4. Run `sqlc generate` after adding
 
+### Changelog
+
+Every PR adds a changelog fragment with `changie new` (`brew install changie`). Never edit `CHANGELOG.md` in a PR.
+
+In this fork (`fresha/pgdoctor`), do not run `changie merge`: it would rewrite the fork's CHANGELOG history. Send fixes to [emancu/pgdoctor](https://github.com/emancu/pgdoctor). Only an upstream import PR edits `CHANGELOG.md` here.
+
+```bash
+changie new --kind Fixed --custom 'Component=`pk-types`' --custom PR=123 --body 'what changed'
+```
+
+Kinds: `Breaking`, `Added`, `Changed`, `Fixed`.
+
+### Releasing
+
+1. Run `changie batch <version>`, without the `v` prefix.
+2. Run `changie merge`.
+3. Open a release PR, and merge it.
+4. The `auto-tag` workflow reads the version from `CHANGELOG.md`, tags `v<version>`, and publishes the release.
+
 ## Critical Rules
 
 ### DO

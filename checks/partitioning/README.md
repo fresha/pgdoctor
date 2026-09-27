@@ -1,12 +1,12 @@
 # Table Partitioning Check
 
-Validates that large tables (>= 10M rows) are properly partitioned according to architecture guidelines.
+Validates that large tables are properly partitioned according to architecture guidelines.
 
 ## How to Fix
 
 ### For `large-unpartitioned`
 
-Tables with >=25M rows must be partitioned to improve query performance, maintenance, and archival:
+Tables with >= 50M rows (see Configuration) should be partitioned to improve query performance, maintenance, and archival:
 
 **Strategy 1: Range partitioning (for time-series data)**
 
@@ -66,7 +66,7 @@ TRUNCATE TABLE outbox_events_w0;  -- Truncate partition for current week % 4
 
 ### For `inefficient-partitions`
 
-Individual partitions with >=25M rows indicate partition strategy needs adjustment:
+Individual partitions with >= 10M rows (see Configuration) indicate partition strategy needs adjustment:
 
 **For time-based partitions (too wide):**
 ```sql
@@ -99,31 +99,27 @@ DROP TABLE sales_2024;
 
 Identifies large business tables that are not partitioned.
 
-**Standard Thresholds:**
-- Warning: Tables with >= 25M rows not partitioned
-- Critical: Tables with >= 50M rows not partitioned
+**Threshold:** Tables with >= 50M rows not partitioned (see Configuration).
 
-**Activity-Aware Thresholds (lower for write-heavy tables):**
-- Warning: Tables with >= 10M rows not partitioned
-- Critical: Tables with >= 25M rows not partitioned
+The `Reason` column shows the write pattern of each table:
 
-| Table Type | WARN | FAIL |
-|------------|------|------|
-| Regular | 25M rows | 50M rows |
-| Insert-heavy (>80% inserts) | 10M rows | 25M rows |
-| High-delete (>20% deletes/inserts) | 10M rows | 25M rows |
+| Reason | Write pattern |
+|--------|---------------|
+| Insert-heavy | >80% inserts |
+| High-delete | >20% deletes/inserts |
+| Large table | Neither |
 
-**Why activity-aware?** Write-heavy tables benefit more from partitioning:
+**Why the write pattern matters:** Write-heavy tables benefit more from partitioning:
 - INSERT-heavy often means time-series data; partitions enable `DROP PARTITION` vs slow `DELETE`
 - High insert rates cause B-tree page splits and index bloat
 - More inserts = more dead tuples from subsequent updates/deletes requiring vacuum
 - `TRUNCATE PARTITION` is instant vs `DELETE` which generates dead tuples
 
-> **Note**: This check depends on PostgreSQL runtime statistics. For accurate activity ratios, statistics should be at least 7 days old. Run the `statistics-freshness` check to validate statistics maturity.
+> **Note**: This check depends on PostgreSQL runtime statistics. For accurate activity ratios, statistics should be at least 7 days old. Run the `db-statistics` check to validate statistics maturity.
 
 ### transient-unpartitioned
 
-Identifies large transient tables (outbox, inbox, jobs, queues) that are not partitioned.
+Identifies large transient tables (outbox, inbox, jobs, queues) with >= 10M rows (see Configuration) that are not partitioned.
 
 **Detected table patterns (regex):**
 - `outbox`, `inbox` - Event sourcing tables
@@ -132,18 +128,42 @@ Identifies large transient tables (outbox, inbox, jobs, queues) that are not par
 - `logs` - Generic debug/log tables
 - `events` - Event tables
 
-**Required:** All large transient tables MUST be partitioned (FAIL severity).
+**Required:** All large transient tables MUST be partitioned.
 
 ### inefficient-partitions
 
-Identifies individual partitions that have grown too large (>= 10M rows), indicating the partition strategy is ineffective.
+Identifies individual partitions that have grown too large (>= 10M rows by default), indicating the partition strategy is ineffective.
 
 **Common causes:**
 - Time-based partitions are too wide (yearly instead of monthly)
 - Hash partitions have too few buckets
 - Uneven data distribution across partition keys
 
-**Severity:** Warning - review and adjust the partitioning strategy.
+## Configuration
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `inefficient_partitions_min_rows` | Row count at which `inefficient-partitions` reports a partition | `10000000` |
+| `large_unpartitioned_min_rows` | Row count at which `large-unpartitioned` reports a table | `50000000` |
+| `transient_unpartitioned_min_rows` | Row count at which `transient-unpartitioned` reports a transient table | `10000000` |
+
+A value that is not a positive integer is an error.
+
+```yaml
+partitioning:
+  inefficient_partitions_min_rows: 25000000
+```
+
+As a library, pass a `partitioning.Config` in `check.Config`:
+
+```go
+cfg := partitioning.DefaultConfig()
+cfg.InefficientPartitionsMinRows = 25_000_000
+pgdoctor.Run(ctx, conn, pgdoctor.Options{
+    Checks: pgdoctor.AllChecks(),
+    Config: check.Config{"partitioning": cfg},
+})
+```
 
 ## Architecture Guidelines
 

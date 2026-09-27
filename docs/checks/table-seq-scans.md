@@ -2,7 +2,7 @@
 
 Identifies tables with excessive sequential scan activity relative to index scans, indicating potential missing indexes.
 
-> **Note**: This check depends on PostgreSQL runtime statistics. For accurate results, statistics should be at least 7 days old. Run the `statistics-freshness` check to validate statistics maturity.
+> **Note**: This check depends on PostgreSQL runtime statistics. For accurate results, statistics should be at least 7 days old. Run the `db-statistics` check to validate statistics maturity.
 
 ## What It Checks
 
@@ -11,23 +11,51 @@ Identifies tables with excessive sequential scan activity relative to index scan
 Analyzes the ratio of sequential scans to index scans on tables:
 
 **FAIL**:
-- Tables with > 50,000 rows
-- Sequential scan / index scan ratio > 50:1
+- Tables with >= 50,000 rows (see Configuration)
+- Sequential scan / index scan ratio >= 50:1 (see Configuration)
 - Has at least one index (tables without indexes are excluded)
 
 **WARN**:
-- Tables with > 10,000 rows
-- Sequential scan / index scan ratio > 10:1
+- Tables with >= 10,000 rows
+- Sequential scan / index scan ratio >= 10:1
 - Has at least one index
+
+A table with no index scans meets every ratio threshold.
 
 **Excludes**:
 - Small tables (< 10,000 rows) where sequential scans are efficient
 - Tables with no indexes (may be intentional staging/temp tables)
-- System schemas
+- System schemas (`pg_catalog`, `information_schema`, `pg_toast`); every other schema is read
+- Temporary tables
 
 ## Statistics Requirements
 
-This check requires at least **7 days** of statistics history. Recent statistics resets will trigger a warning.
+This check requires at least **7 days** of statistics history. After a recent statistics reset, the ratios do not represent the workload.
+
+## Configuration
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `high_seq_scans_min_rows` | Row count at which `high-seq-scans` reports a table | `50000` |
+| `high_seq_scans_min_ratio` | Sequential scan / index scan ratio at which `high-seq-scans` reports a table | `50` |
+
+A row count that is not a positive integer, or a ratio that is not a positive number, is an error.
+
+```yaml
+table-seq-scans:
+  high_seq_scans_min_rows: 1000000
+  high_seq_scans_min_ratio: 100
+```
+
+As a library, pass a `tableseqscans.Config` in `check.Config`:
+
+```go
+cfg := tableseqscans.Config{HighSeqScansMinRows: 1_000_000, HighSeqScansMinRatio: 100}
+pgdoctor.Run(ctx, conn, pgdoctor.Options{
+    Checks: pgdoctor.AllChecks(),
+    Config: check.Config{"table-seq-scans": cfg},
+})
+```
 
 ## Important Considerations
 
@@ -51,6 +79,14 @@ Always analyze actual query patterns before adding indexes.
 
 ## How to Fix
 
+### For `high-seq-scans`
+
+Large tables are read mostly by sequential scans. Find the queries that scan them and add the missing indexes, with the steps below. Start with the largest tables.
+
+### For `moderate-seq-scans`
+
+Use the same steps as for `high-seq-scans`. These tables are smaller or scanned less often, so the fix is less urgent.
+
 ### Investigation Steps
 
 1. **Identify Problematic Queries**:
@@ -72,7 +108,7 @@ SELECT * FROM table_name WHERE commonly_filtered_column = value;
 ```sql
 SELECT indexname, indexdef
 FROM pg_indexes
-WHERE tablename = 'table_name';
+WHERE schemaname = 'schema' AND tablename = 'table_name';
 ```
 
 ### Creating Indexes

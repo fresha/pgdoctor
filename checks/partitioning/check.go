@@ -17,22 +17,38 @@ var querySQL string
 var readme string
 
 type PartitioningQueries interface {
-	LargeTables(context.Context) ([]db.LargeTablesRow, error)
+	LargeTables(ctx context.Context, arg db.LargeTablesParams) ([]db.LargeTablesRow, error)
+}
+
+type Config struct {
+	InefficientPartitionsMinRows  int64 `yaml:"inefficient_partitions_min_rows"`
+	LargeUnpartitionedMinRows     int64 `yaml:"large_unpartitioned_min_rows"`
+	TransientUnpartitionedMinRows int64 `yaml:"transient_unpartitioned_min_rows"`
+}
+
+func DefaultConfig() Config {
+	return Config{
+		InefficientPartitionsMinRows:  10_000_000,
+		LargeUnpartitionedMinRows:     50_000_000,
+		TransientUnpartitionedMinRows: 10_000_000,
+	}
+}
+
+func (c Config) Validate() error {
+	if c.InefficientPartitionsMinRows <= 0 || c.LargeUnpartitionedMinRows <= 0 || c.TransientUnpartitionedMinRows <= 0 {
+		return fmt.Errorf("row thresholds must be positive integers")
+	}
+	return nil
 }
 
 type checker struct {
-	queries PartitioningQueries
+	queries          PartitioningQueries
+	minPartitionRows int64
+	largeMinRows     int64
+	transientMinRows int64
 }
 
 const (
-	// Regular tables thresholds.
-	largeTableFailRows = int64(50_000_000) // MUST be partitioned
-	largeTableWarnRows = int64(25_000_000) // approaching threshold
-
-	// Activity-aware tables use lower thresholds because they benefit more from partitioning.
-	activityAwareFailRows = int64(25_000_000)
-	activityAwareWarnRows = int64(10_000_000)
-
 	// Activity thresholds for determining table write patterns.
 	insertHeavyRatio = 0.80 // >80% of DML operations are inserts
 	highDeleteRatio  = 0.20 // >20% deletes relative to inserts
@@ -49,9 +65,12 @@ func Metadata() check.Metadata {
 	}
 }
 
-func New(queries PartitioningQueries, _ ...check.Config) check.Checker {
+func New(queries PartitioningQueries, cfg Config) check.Checker {
 	return &checker{
-		queries: queries,
+		queries:          queries,
+		minPartitionRows: cfg.InefficientPartitionsMinRows,
+		largeMinRows:     cfg.LargeUnpartitionedMinRows,
+		transientMinRows: cfg.TransientUnpartitionedMinRows,
 	}
 }
 
@@ -62,7 +81,10 @@ func (c *checker) Metadata() check.Metadata {
 func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 	report := check.NewReport(Metadata())
 
-	rows, err := c.queries.LargeTables(ctx)
+	rows, err := c.queries.LargeTables(ctx, db.LargeTablesParams{
+		MinTableRows:     min(c.largeMinRows, c.transientMinRows),
+		MinPartitionRows: c.minPartitionRows,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("running %s/%s: %w", check.CategorySchema, report.CheckID, err)
 	}
@@ -84,8 +106,10 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 		}
 
 		if row.IsTransient.Valid && row.IsTransient.Bool {
-			transientUnpartitioned = append(transientUnpartitioned, row)
-		} else {
+			if row.EstimatedRows.Int64 >= c.transientMinRows {
+				transientUnpartitioned = append(transientUnpartitioned, row)
+			}
+		} else if row.EstimatedRows.Int64 >= c.largeMinRows {
 			largeUnpartitioned = append(largeUnpartitioned, row)
 		}
 	}
@@ -93,7 +117,7 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 	// Run subchecks.
 	checkLargeUnpartitioned(largeUnpartitioned, report)
 	checkTransientUnpartitioned(transientUnpartitioned, report)
-	checkInefficientPartitions(inefficientPartitions, report)
+	checkInefficientPartitions(inefficientPartitions, c.minPartitionRows, report)
 
 	return report, nil
 }
@@ -120,12 +144,7 @@ func isHighDelete(row db.LargeTablesRow) bool {
 	return float64(del)/float64(ins) > highDeleteRatio
 }
 
-// isActivityAware returns true if the table qualifies for lower thresholds.
-func isActivityAware(row db.LargeTablesRow) bool {
-	return isInsertHeavy(row) || isHighDelete(row)
-}
-
-// activityReason returns a human-readable reason for activity-aware flagging.
+// activityReason returns a human-readable write pattern for the table.
 func activityReason(row db.LargeTablesRow) string {
 	if isInsertHeavy(row) {
 		return "Insert-heavy"
@@ -137,29 +156,7 @@ func activityReason(row db.LargeTablesRow) string {
 }
 
 func checkLargeUnpartitioned(rows []db.LargeTablesRow, report *check.Report) {
-	var critical []db.LargeTablesRow
-	var warning []db.LargeTablesRow
-
-	for _, row := range rows {
-		estRows := row.EstimatedRows.Int64
-
-		// Use lower thresholds for insert-heavy/high-delete tables.
-		warnThreshold := largeTableWarnRows
-		failThreshold := largeTableFailRows
-		if isActivityAware(row) {
-			warnThreshold = activityAwareWarnRows
-			failThreshold = activityAwareFailRows
-		}
-
-		if estRows >= failThreshold {
-			critical = append(critical, row)
-		} else if estRows >= warnThreshold {
-			warning = append(warning, row)
-		}
-	}
-
-	// If no tables meet either threshold, report OK.
-	if len(critical) == 0 && len(warning) == 0 {
+	if len(rows) == 0 {
 		report.AddFinding(check.Finding{
 			ID:       "large-unpartitioned",
 			Name:     "Large Unpartitioned Tables",
@@ -170,45 +167,25 @@ func checkLargeUnpartitioned(rows []db.LargeTablesRow, report *check.Report) {
 	}
 
 	var tableRows []check.TableRow
-
-	for _, row := range critical {
+	for _, row := range rows {
 		tableRows = append(tableRows, check.TableRow{
 			Cells: []string{
 				row.TableName.String,
 				check.FormatBytes(row.TableSizeBytes.Int64),
 				check.FormatNumber(row.EstimatedRows.Int64),
 				activityReason(row),
-				"MUST partition",
-			},
-			Severity: check.SeverityFail,
-		})
-	}
-
-	for _, row := range warning {
-		tableRows = append(tableRows, check.TableRow{
-			Cells: []string{
-				row.TableName.String,
-				check.FormatBytes(row.TableSizeBytes.Int64),
-				check.FormatNumber(row.EstimatedRows.Int64),
-				activityReason(row),
-				"Approaching threshold",
 			},
 			Severity: check.SeverityWarn,
 		})
 	}
 
-	severity := check.SeverityWarn
-	if len(critical) > 0 {
-		severity = check.SeverityFail
-	}
-
 	report.AddFinding(check.Finding{
 		ID:       "large-unpartitioned",
 		Name:     "Large Unpartitioned Tables",
-		Severity: severity,
+		Severity: check.SeverityWarn,
 		Details:  fmt.Sprintf("Found %d large table(s) that should be partitioned", len(rows)),
 		Table: &check.Table{
-			Headers: []string{"Table", "Size", "Est. Rows", "Reason", "Status"},
+			Headers: []string{"Table", "Size", "Est. Rows", "Reason"},
 			Rows:    tableRows,
 		},
 	})
@@ -234,14 +211,14 @@ func checkTransientUnpartitioned(rows []db.LargeTablesRow, report *check.Report)
 				check.FormatBytes(row.TableSizeBytes.Int64),
 				check.FormatNumber(row.EstimatedRows.Int64),
 			},
-			Severity: check.SeverityFail,
+			Severity: check.SeverityWarn,
 		})
 	}
 
 	report.AddFinding(check.Finding{
 		ID:       "transient-unpartitioned",
 		Name:     "Transient Tables Partitioning",
-		Severity: check.SeverityFail,
+		Severity: check.SeverityWarn,
 		Details:  fmt.Sprintf("Found %d large transient table(s) without partitioning", len(rows)),
 		Table: &check.Table{
 			Headers: []string{"Table", "Size", "Est. Rows"},
@@ -251,14 +228,14 @@ func checkTransientUnpartitioned(rows []db.LargeTablesRow, report *check.Report)
 }
 
 // checkInefficientPartitions identifies partitions that are too large, indicating poor partition strategy.
-func checkInefficientPartitions(rows []db.LargeTablesRow, report *check.Report) {
+func checkInefficientPartitions(rows []db.LargeTablesRow, minRows int64, report *check.Report) {
 	if len(rows) == 0 {
 		return // No finding needed when there are no inefficient partitions
 	}
 
 	var tableRows []check.TableRow
 	for _, row := range rows {
-		parentTable := "unknown"
+		parentTable := "-"
 		if row.ParentTable.Valid {
 			parentTable = row.ParentTable.String
 		}
@@ -277,7 +254,7 @@ func checkInefficientPartitions(rows []db.LargeTablesRow, report *check.Report) 
 		ID:       "inefficient-partitions",
 		Name:     "Inefficient Partition Strategy",
 		Severity: check.SeverityWarn,
-		Details:  fmt.Sprintf("Found %d partition(s) with >= 25M rows - partition strategy may be inefficient", len(rows)),
+		Details:  fmt.Sprintf("Found %d partition(s) with >= %s rows - partition strategy may be inefficient", len(rows), check.FormatNumber(minRows)),
 		Table: &check.Table{
 			Headers: []string{"Partition", "Parent Table", "Size", "Est. Rows"},
 			Rows:    tableRows,

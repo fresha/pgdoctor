@@ -16,17 +16,15 @@ PostgreSQL's autovacuum maintains table health by removing dead tuples, updating
 
 Lists tables where `autovacuum_enabled=false` has been explicitly set.
 
-**Severity:** Warning
-
 These tables rely entirely on manual maintenance. Common legitimate uses:
 - Bulk import staging tables (re-enable after import)
 - Tables managed by external ETL processes
 
+To stop the report of a table that has autovacuum disabled on purpose, use the `ignore_tables` key (see Configuration).
+
 ### large-table-defaults
 
-Identifies tables with more than 1 million rows using default autovacuum scale factors.
-
-**Severity:** Warning
+Identifies tables with more than 1 million rows that have no per-table `autovacuum_vacuum_scale_factor`, when the server value is the default (0.2) or higher.
 
 The default `autovacuum_vacuum_scale_factor` is 0.2 (20%), meaning autovacuum triggers when dead tuples exceed 20% of the table size:
 
@@ -49,7 +47,7 @@ ALTER TABLE schema.large_table SET (
 
 Identifies tables that haven't been vacuumed or analyzed recently despite pending work.
 
-**Severity:**
+**Thresholds:**
 - Warning: No vacuum/analyze in 7+ days with 250,000+ pending work
 - Fail: No vacuum/analyze in 25+ days with 500,000+ pending work
 
@@ -62,7 +60,7 @@ Tables that go too long without maintenance may have:
 
 Table size is a **lock-free estimate** derived from `pg_class`: heap `relpages` + the TOAST relation's `relpages` + the sum of `relpages` over the table's indexes, times `block_size`.
 
-It is deliberately not `pg_total_relation_size()`, which takes an `AccessShareLock`. A new `AccessShareLock` request queues behind a *waiting* `AccessExclusiveLock`, so with a 2-second `statement_timeout` this check would SKIP during a DDL pile-up — and it runs for every table, not a top-N. The trade-off: `relpages` is only refreshed by `VACUUM`/`ANALYZE`, so the estimate is stale by definition and `0` on a never-vacuumed table.
+It is deliberately not `pg_total_relation_size()`, which takes an `AccessShareLock`. A new `AccessShareLock` request queues behind a *waiting* `AccessExclusiveLock`, so with a 2-second `statement_timeout` this check would time out during a DDL pile-up — and it runs for every table, not a top-N. The trade-off: `relpages` is only refreshed by `VACUUM`/`ANALYZE`, so the estimate is stale by definition and `0` on a never-vacuumed table.
 
 ## Pending Work Column
 
@@ -87,10 +85,13 @@ ALTER TABLE schema.table_name RESET (autovacuum_enabled);
 
 **Monitor these tables regularly:**
 ```sql
-SELECT relname, n_dead_tup, last_vacuum, last_autovacuum
+SELECT s.relname, n_dead_tup, last_vacuum, last_autovacuum
 FROM pg_stat_user_tables s
 JOIN pg_class c ON c.oid = s.relid
-WHERE c.reloptions @> ARRAY['autovacuum_enabled=false'];
+WHERE EXISTS (
+  SELECT 1 FROM pg_options_to_table(c.reloptions) o
+  WHERE o.option_name = 'autovacuum_enabled' AND NOT o.option_value::boolean
+);
 ```
 
 ### For `large-table-defaults`
@@ -162,9 +163,40 @@ When the analyze arm is the one tripping, run `ANALYZE schema.table_name` (or lo
 4. Ensure autovacuum workers and cost limits are appropriately configured
 5. Lower analyze thresholds for tables with high modification rates
 
+## Configuration
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `ignore_tables` | List of table-name prefixes that the `autovacuum-disabled` finding does not report. The other findings still report these tables | None |
+
+A prefix matches the schema-qualified table name (`schema.table`). A prefix matches every name that starts with it: `public.outbox` also matches `public.outbox_archive`. The match is case-sensitive. An empty prefix is an error. The key changes only the `autovacuum-disabled` finding: the other findings still report an excluded table.
+
+A partition leaf matches only when its name starts with the prefix. `public.outbox_events` matches `public.outbox_events_p20260101`, but not a leaf with a different name or in another schema.
+
+```yaml
+table-vacuum-health:
+  ignore_tables:
+    - public.outbox_events
+    - public.audit_logs
+```
+
+As a library, pass a `tablevacuumhealth.Config` in `check.Config`:
+
+```go
+cfg := tablevacuumhealth.Config{
+    IgnoreTables: []string{"public.outbox_events", "public.audit_logs"},
+}
+pgdoctor.Run(ctx, conn, pgdoctor.Options{
+    Checks: pgdoctor.AllChecks(),
+    Config: check.Config{"table-vacuum-health": cfg},
+})
+```
+
+When no config is provided, `autovacuum-disabled` reports every table with autovacuum disabled.
+
 ## Related Checks
 
 - `freeze-age`: Monitors transaction ID age at database and table level
 - `vacuum-settings`: Validates global vacuum configuration
 - `table-bloat`: Detects tables with excessive dead tuple bloat
-- `statistics-freshness`: Validates database-level statistics maturity
+- `db-statistics`: Validates database-level statistics maturity

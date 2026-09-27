@@ -8,8 +8,6 @@ Verifies that PostgreSQL replication slots are healthy, active, and not lagging 
 
 Detects replication slots that have been marked invalid by PostgreSQL (PG17+ only).
 
-**Severity:** FAIL
-
 **Threshold:** Any slot with an invalidation reason
 
 **Why this matters:** Invalid slots indicate the slot is unusable and will never recover. The slot must be dropped and recreated. Common causes:
@@ -20,8 +18,6 @@ Detects replication slots that have been marked invalid by PostgreSQL (PG17+ onl
 ### lost-wal-slots
 
 Detects slots where required WAL files have been removed or are no longer reserved.
-
-**Severity:** FAIL
 
 **Thresholds:**
 - `wal_status = 'lost'` - WAL files were already removed
@@ -36,8 +32,6 @@ Detects slots where required WAL files have been removed or are no longer reserv
 
 Detects slots in a conflicting state (PG17+ only).
 
-**Severity:** WARN
-
 **Threshold:** `conflicting = true`
 
 **Why this matters:** Conflicting slots indicate potential issues with the slot's requirements conflicting with database operations. This is typically a transient state but may indicate configuration problems.
@@ -45,8 +39,6 @@ Detects slots in a conflicting state (PG17+ only).
 ### inactive-slots
 
 Detects replication slots that are not actively consuming changes.
-
-**Severity:** WARN
 
 **Threshold:** `active = false`
 
@@ -60,9 +52,7 @@ Inactive slots will eventually lead to disk exhaustion if not addressed.
 
 ### critical-lag
 
-Detects slots with severe replication lag.
-
-**Severity:** FAIL
+Detects active and inactive slots with severe replication lag.
 
 **Threshold:** >= 5GB lag
 
@@ -76,9 +66,7 @@ At this level of lag, consider whether the consumer can realistically catch up o
 
 ### high-lag
 
-Detects slots with elevated replication lag.
-
-**Severity:** WARN
+Detects active and inactive slots with elevated replication lag.
 
 **Threshold:** >= 1GB and < 5GB lag
 

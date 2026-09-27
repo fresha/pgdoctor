@@ -2,7 +2,7 @@
 
 Analyzes table write activity to identify high-churn tables and HOT update efficiency issues.
 
-> **Note**: This check depends on PostgreSQL runtime statistics. For accurate results, statistics should be at least 7 days old. Run the `statistics-freshness` check to validate statistics maturity.
+> **Note**: This check depends on PostgreSQL runtime statistics. For accurate results, statistics should be at least 7 days old. Run the `db-statistics` check to validate statistics maturity.
 
 ## What It Checks
 
@@ -107,6 +107,10 @@ If the above options don't resolve the issue, contact the DBA or Data Engineerin
 - Run `pg_repack` to rebuild the table with minimal locking
 - Evaluate if the table structure needs changes
 - Help with index strategy review
+
+### For `table-activity`
+
+The statistics hold no table writes yet. This is normal right after a restart or a statistics reset. Let the workload run, then run the check again.
 
 ## Thresholds Rationale
 

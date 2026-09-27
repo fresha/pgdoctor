@@ -5,17 +5,39 @@ WITH sequence_info AS (
     s.schemaname::text AS schema_name
     , s.sequencename::text AS sequence_name
     , s.data_type::text AS seq_data_type
+    , s.min_value
     , s.max_value
     , s.increment_by
     , s.cycle AS is_cyclic
-    , COALESCE(s.last_value, s.start_value) AS current_value
-    , CASE
-      WHEN s.max_value > 0 AND COALESCE(s.last_value, s.start_value) > 0
-        THEN (COALESCE(s.last_value, s.start_value)::numeric / s.max_value::numeric) * 100
-      ELSE 0
-    END AS usage_percent
-    , (s.max_value - COALESCE(s.last_value, s.start_value)) / NULLIF(s.increment_by, 0) AS remaining_values
+    , cur.value AS current_value
+    , (cur.value IS NULL) AS is_unreadable
+    -- numeric: a full bigint range overflows bigint subtraction.
+    -- Usage counts from 0, or from the range bound when 0 is outside the range.
+    , CASE WHEN cur.value IS NOT NULL THEN GREATEST(0, CASE
+      WHEN s.increment_by > 0
+        THEN (cur.value - base.ascending::numeric) / NULLIF(s.max_value - base.ascending::numeric, 0)
+      ELSE (base.descending - cur.value::numeric) / NULLIF(base.descending - s.min_value::numeric, 0)
+    END) * 100 END AS usage_percent
+    , LEAST(TRUNC(CASE
+      WHEN s.increment_by > 0
+        THEN (s.max_value - cur.value::numeric) / s.increment_by
+      ELSE (cur.value - s.min_value::numeric) / -s.increment_by::numeric
+    END), 9223372036854775807)::bigint AS remaining_values
   FROM pg_sequences AS s
+  -- last_value is NULL both for a sequence never called and for one the role cannot read.
+  CROSS JOIN LATERAL (
+    SELECT CASE
+      WHEN s.last_value IS NOT NULL
+        THEN s.last_value
+      WHEN has_sequence_privilege(quote_ident(s.schemaname) || '.' || quote_ident(s.sequencename), 'SELECT,USAGE')
+        THEN s.start_value
+    END AS value
+  ) AS cur
+  CROSS JOIN LATERAL (
+    SELECT
+      CASE WHEN s.max_value > 0 THEN GREATEST(s.min_value, 0) ELSE s.min_value END AS ascending
+      , CASE WHEN s.min_value < 0 THEN LEAST(s.max_value, 0) ELSE s.max_value END AS descending
+  ) AS base
   WHERE s.schemaname NOT IN ('pg_catalog', 'information_schema')
 )
 
@@ -70,22 +92,37 @@ WITH sequence_info AS (
 
 SELECT
   si.schema_name
-  , si.sequence_name
+  , (si.schema_name || '.' || si.sequence_name)::text AS sequence_name
   , si.seq_data_type
   , si.current_value
+  , si.min_value
   , si.max_value
   , si.increment_by
   , si.is_cyclic
+  , si.is_unreadable
   , si.remaining_values
   , ROUND(si.usage_percent::numeric, 2) AS usage_percent
-  , COALESCE(so.table_name, '') AS table_name
+  , COALESCE(so.table_schema || '.' || so.table_name, '')::text AS table_name
   , COALESCE(so.column_name, '') AS column_name
   , COALESCE(so.column_type, '') AS column_type
   , COALESCE(so.column_max_value, 0) AS column_max_value
   -- Flag if sequence can generate values that exceed column type
-  , (so.column_max_value IS NOT NULL AND si.max_value > so.column_max_value) AS sequence_exceeds_column
-  -- Flag if this is an integer column that should probably be bigint
-  , (so.column_type != 'bigint' AND si.usage_percent > 50) AS should_be_bigint
+  , (
+    so.column_max_value IS NOT NULL
+    AND (si.max_value > so.column_max_value OR si.min_value < -so.column_max_value - 1)
+  ) AS sequence_exceeds_column
+  -- Usage of the column type range, from 0 toward the limit in the sequence direction.
+  -- A value already outside the range fails inserts in either direction, so it is above 100.
+  , CASE WHEN so.column_type IN ('integer', 'smallint') THEN ROUND(GREATEST(
+    0
+    , CASE
+      WHEN si.increment_by > 0
+        THEN si.current_value::numeric / so.column_max_value
+      ELSE -si.current_value::numeric / (so.column_max_value + 1)
+    END
+    , CASE WHEN si.current_value > so.column_max_value THEN si.current_value::numeric / so.column_max_value END
+    , CASE WHEN si.current_value < -so.column_max_value - 1 THEN -si.current_value::numeric / (so.column_max_value + 1) END
+  ) * 100, 2) END AS column_usage_percent
   -- Flag if column is a primary key
   , (pk.table_oid IS NOT NULL) AS is_primary_key
   -- Count of foreign keys referencing this column
@@ -104,4 +141,4 @@ LEFT JOIN fk_references AS fkr
   ON
     so.table_oid = fkr.referenced_table_oid
     AND so.column_num = fkr.referenced_column_num
-ORDER BY si.usage_percent DESC, si.remaining_values ASC;
+ORDER BY si.usage_percent DESC NULLS LAST, si.remaining_values ASC;

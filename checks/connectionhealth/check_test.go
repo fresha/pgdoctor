@@ -2,6 +2,7 @@ package connectionhealth_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -132,7 +133,7 @@ func Test_ConnectionHealth_AllOK(t *testing.T) {
 		longIdle: nil,
 	}
 
-	checker := connectionhealth.New(mock)
+	checker := connectionhealth.New(mock, connectionhealth.DefaultConfig())
 	report, err := checker.Check(ctxWithPgVersion(17))
 
 	require.NoError(t, err)
@@ -201,7 +202,7 @@ func Test_ConnectionHealth_Saturation(t *testing.T) {
 				stats: stats,
 			}
 
-			checker := connectionhealth.New(mock)
+			checker := connectionhealth.New(mock, connectionhealth.DefaultConfig())
 			report, err := checker.Check(ctxWithPgVersion(17))
 
 			require.NoError(t, err)
@@ -249,18 +250,18 @@ func Test_ConnectionHealth_PoolPressure(t *testing.T) {
 			expectedSeverity: check.SeverityWarn,
 		},
 		{
-			name:             "critical - high active, almost no idle",
+			name:             "high active, almost no idle still warns",
 			total:            50,
 			active:           49, // 98% active
-			idle:             1,  // <= 1 idle
-			expectedSeverity: check.SeverityFail,
+			idle:             1,
+			expectedSeverity: check.SeverityWarn,
 		},
 		{
-			name:             "critical - all connections active",
+			name:             "all connections active still warns",
 			total:            50,
 			active:           50, // 100% active
-			idle:             0,  // no idle
-			expectedSeverity: check.SeverityFail,
+			idle:             0,
+			expectedSeverity: check.SeverityWarn,
 		},
 	}
 
@@ -277,7 +278,7 @@ func Test_ConnectionHealth_PoolPressure(t *testing.T) {
 				stats: stats,
 			}
 
-			checker := connectionhealth.New(mock)
+			checker := connectionhealth.New(mock, connectionhealth.DefaultConfig())
 			report, err := checker.Check(ctxWithPgVersion(17))
 
 			require.NoError(t, err)
@@ -341,7 +342,7 @@ func Test_ConnectionHealth_IdleRatio(t *testing.T) {
 				stats: stats,
 			}
 
-			checker := connectionhealth.New(mock)
+			checker := connectionhealth.New(mock, connectionhealth.DefaultConfig())
 			report, err := checker.Check(ctxWithPgVersion(17))
 
 			require.NoError(t, err)
@@ -350,11 +351,48 @@ func Test_ConnectionHealth_IdleRatio(t *testing.T) {
 	}
 }
 
+func TestConfigValidate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		count   int64
+		wantErr bool
+	}{
+		{100, false},
+		{1, false},
+		{0, true},
+		{-5, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(fmt.Sprint(tt.count), func(t *testing.T) {
+			t.Parallel()
+
+			err := connectionhealth.Config{LongIdleWarnCount: tt.count}.Validate()
+			if tt.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
 func Test_ConnectionHealth_IdleInTransaction(t *testing.T) {
 	t.Parallel()
 
-	// With default 5min timeout (when TimeoutMs is 0): warn at 150s, fail at 300s.
-	// TimeoutMs=0 in row means use default.
+	idleTxn := func(pid int32, idleSeconds int64) db.IdleInTransactionRow {
+		return db.IdleInTransactionRow{
+			Pid:                 int32Val(pid),
+			Username:            textVal("app_rw"),
+			DatabaseName:        textVal("production"),
+			ApplicationName:     textVal("myapp"),
+			State:               textVal("idle in transaction"),
+			IdleDurationSeconds: int64Val(idleSeconds),
+			QueryPreview:        textVal("SELECT * FROM orders"),
+		}
+	}
+
 	tests := []struct {
 		name             string
 		idleTxns         []db.IdleInTransactionRow
@@ -366,93 +404,28 @@ func Test_ConnectionHealth_IdleInTransaction(t *testing.T) {
 			expectedSeverity: check.SeverityPass,
 		},
 		{
-			name: "below warn threshold (default timeout)",
-			idleTxns: []db.IdleInTransactionRow{
-				{
-					Pid:                        int32Val(1234),
-					Username:                   textVal("app_rw"),
-					DatabaseName:               textVal("production"),
-					ApplicationName:            textVal("myapp"),
-					State:                      textVal("idle in transaction"),
-					TransactionDurationSeconds: int64Val(100), // 100s < 150s warn threshold
-					QueryPreview:               textVal("SELECT * FROM users"),
-					TimeoutMs:                  int64Val(0), // 0 = use default 5min
-				},
-			},
+			name:             "below warn threshold",
+			idleTxns:         []db.IdleInTransactionRow{idleTxn(1234, 299)},
 			expectedSeverity: check.SeverityPass,
 		},
 		{
-			name: "warning level (default timeout)",
-			idleTxns: []db.IdleInTransactionRow{
-				{
-					Pid:                        int32Val(1234),
-					Username:                   textVal("app_rw"),
-					DatabaseName:               textVal("production"),
-					ApplicationName:            textVal("myapp"),
-					State:                      textVal("idle in transaction"),
-					TransactionDurationSeconds: int64Val(200), // 200s >= 150s warn, < 300s fail
-					QueryPreview:               textVal("SELECT * FROM orders"),
-					TimeoutMs:                  int64Val(0),
-				},
-			},
+			name:             "at warn threshold (5 min)",
+			idleTxns:         []db.IdleInTransactionRow{idleTxn(1234, 300)},
 			expectedSeverity: check.SeverityWarn,
 		},
 		{
-			name: "fail level (default timeout)",
-			idleTxns: []db.IdleInTransactionRow{
-				{
-					Pid:                        int32Val(1234),
-					Username:                   textVal("app_rw"),
-					DatabaseName:               textVal("production"),
-					ApplicationName:            textVal("myapp"),
-					State:                      textVal("idle in transaction"),
-					TransactionDurationSeconds: int64Val(300), // 300s = fail threshold
-					QueryPreview:               textVal("BEGIN; UPDATE accounts SET balance = 0"),
-					TimeoutMs:                  int64Val(0),
-				},
-			},
+			name:             "below fail threshold",
+			idleTxns:         []db.IdleInTransactionRow{idleTxn(1234, 3599)},
+			expectedSeverity: check.SeverityWarn,
+		},
+		{
+			name:             "at fail threshold (1 h)",
+			idleTxns:         []db.IdleInTransactionRow{idleTxn(1234, 3600)},
 			expectedSeverity: check.SeverityFail,
 		},
 		{
-			name: "uses DB timeout setting",
-			idleTxns: []db.IdleInTransactionRow{
-				{
-					Pid:                        int32Val(1234),
-					Username:                   textVal("app_rw"),
-					DatabaseName:               textVal("production"),
-					ApplicationName:            textVal("myapp"),
-					State:                      textVal("idle in transaction"),
-					TransactionDurationSeconds: int64Val(400), // 400s >= 300s warn, < 600s fail
-					QueryPreview:               textVal("SELECT * FROM orders"),
-					TimeoutMs:                  int64Val(600000), // 10 minutes = 600s, warn at 300s, fail at 600s
-				},
-			},
-			expectedSeverity: check.SeverityWarn,
-		},
-		{
-			name: "multiple with mixed severity",
-			idleTxns: []db.IdleInTransactionRow{
-				{
-					Pid:                        int32Val(1234),
-					Username:                   textVal("app_rw"),
-					DatabaseName:               textVal("production"),
-					ApplicationName:            textVal("myapp"),
-					State:                      textVal("idle in transaction"),
-					TransactionDurationSeconds: int64Val(200), // warning
-					QueryPreview:               textVal("SELECT * FROM users"),
-					TimeoutMs:                  int64Val(0),
-				},
-				{
-					Pid:                        int32Val(5678),
-					Username:                   textVal("app_rw"),
-					DatabaseName:               textVal("production"),
-					ApplicationName:            textVal("batch"),
-					State:                      textVal("idle in transaction"),
-					TransactionDurationSeconds: int64Val(350), // fail
-					QueryPreview:               textVal("DELETE FROM logs"),
-					TimeoutMs:                  int64Val(0),
-				},
-			},
+			name:             "multiple with mixed severity",
+			idleTxns:         []db.IdleInTransactionRow{idleTxn(1234, 600), idleTxn(5678, 7200)},
 			expectedSeverity: check.SeverityFail, // highest severity wins
 		},
 	}
@@ -466,7 +439,7 @@ func Test_ConnectionHealth_IdleInTransaction(t *testing.T) {
 				idleTxns: tt.idleTxns,
 			}
 
-			checker := connectionhealth.New(mock)
+			checker := connectionhealth.New(mock, connectionhealth.DefaultConfig())
 			report, err := checker.Check(ctxWithPgVersion(17))
 
 			require.NoError(t, err)
@@ -482,6 +455,7 @@ func Test_ConnectionHealth_LongIdle(t *testing.T) {
 		name             string
 		maxConns         int32
 		longIdle         []db.LongIdleConnectionsRow
+		warnCount        int64
 		expectedSeverity check.Severity
 	}{
 		{
@@ -503,16 +477,24 @@ func Test_ConnectionHealth_LongIdle(t *testing.T) {
 			expectedSeverity: check.SeverityWarn,
 		},
 		{
-			name:             "at fail threshold (500) still warns",
+			name:             "far above 100 still warns",
 			maxConns:         100,
-			longIdle:         makeLongIdleRows(500),
+			longIdle:         makeLongIdleRows(501),
 			expectedSeverity: check.SeverityWarn,
 		},
 		{
-			name:             "above 500 fails",
-			maxConns:         100,
-			longIdle:         makeLongIdleRows(501),
-			expectedSeverity: check.SeverityFail,
+			name:             "at configured count stays OK",
+			maxConns:         400,
+			longIdle:         makeLongIdleRows(200),
+			warnCount:        200,
+			expectedSeverity: check.SeverityPass,
+		},
+		{
+			name:             "above configured count warns",
+			maxConns:         400,
+			longIdle:         makeLongIdleRows(11),
+			warnCount:        10,
+			expectedSeverity: check.SeverityWarn,
 		},
 		{
 			name:             "pooled warm floor stays OK",
@@ -534,7 +516,11 @@ func Test_ConnectionHealth_LongIdle(t *testing.T) {
 				longIdle: tt.longIdle,
 			}
 
-			checker := connectionhealth.New(mock)
+			cfg := connectionhealth.DefaultConfig()
+			if tt.warnCount != 0 {
+				cfg.LongIdleWarnCount = tt.warnCount
+			}
+			checker := connectionhealth.New(mock, cfg)
 			report, err := checker.Check(ctxWithPgVersion(17))
 
 			require.NoError(t, err)
@@ -554,19 +540,18 @@ func Test_ConnectionHealth_TableDetails(t *testing.T) {
 			stats: healthyStats(),
 			idleTxns: []db.IdleInTransactionRow{
 				{
-					Pid:                        int32Val(1234),
-					Username:                   textVal("app_rw"),
-					DatabaseName:               textVal("production"),
-					ApplicationName:            textVal("myapp"),
-					State:                      textVal("idle in transaction"),
-					TransactionDurationSeconds: int64Val(200), // >= 150s warn threshold
-					QueryPreview:               textVal("SELECT 1"),
-					TimeoutMs:                  int64Val(0),
+					Pid:                 int32Val(1234),
+					Username:            textVal("app_rw"),
+					DatabaseName:        textVal("production"),
+					ApplicationName:     textVal("myapp"),
+					State:               textVal("idle in transaction"),
+					IdleDurationSeconds: int64Val(600), // >= 5 min warn threshold
+					QueryPreview:        textVal("SELECT 1"),
 				},
 			},
 		}
 
-		checker := connectionhealth.New(mock)
+		checker := connectionhealth.New(mock, connectionhealth.DefaultConfig())
 		report, err := checker.Check(ctxWithPgVersion(17))
 
 		require.NoError(t, err)
@@ -574,7 +559,7 @@ func Test_ConnectionHealth_TableDetails(t *testing.T) {
 		finding := getFinding(report.Results, "idle-in-transaction")
 		require.NotNil(t, finding)
 		require.NotNil(t, finding.Table)
-		require.Equal(t, []string{"PID", "User", "Database", "Duration", "Query"}, finding.Table.Headers)
+		require.Equal(t, []string{"PID", "User", "Database", "Idle Duration", "Query"}, finding.Table.Headers)
 	})
 
 	t.Run("connection-overview has no table (inline details)", func(t *testing.T) {
@@ -584,7 +569,7 @@ func Test_ConnectionHealth_TableDetails(t *testing.T) {
 			stats: healthyStats(),
 		}
 
-		checker := connectionhealth.New(mock)
+		checker := connectionhealth.New(mock, connectionhealth.DefaultConfig())
 		report, err := checker.Check(ctxWithPgVersion(17))
 
 		require.NoError(t, err)
@@ -605,7 +590,7 @@ func Test_ConnectionHealth_TableDetails(t *testing.T) {
 			stats: stats,
 		}
 
-		checker := connectionhealth.New(mock)
+		checker := connectionhealth.New(mock, connectionhealth.DefaultConfig())
 		report, err := checker.Check(ctxWithPgVersion(17))
 
 		require.NoError(t, err)
@@ -627,7 +612,7 @@ func Test_ConnectionHealth_TableDetails(t *testing.T) {
 			stats: stats,
 		}
 
-		checker := connectionhealth.New(mock)
+		checker := connectionhealth.New(mock, connectionhealth.DefaultConfig())
 		report, err := checker.Check(ctxWithPgVersion(17))
 
 		require.NoError(t, err)
@@ -650,20 +635,19 @@ func Test_ConnectionHealth_Prescriptions(t *testing.T) {
 		stats: stats,
 		idleTxns: []db.IdleInTransactionRow{
 			{
-				Pid:                        int32Val(1234),
-				Username:                   textVal("app_rw"),
-				DatabaseName:               textVal("production"),
-				ApplicationName:            textVal("myapp"),
-				State:                      textVal("idle in transaction"),
-				TransactionDurationSeconds: int64Val(200), // >= 150s warn threshold
-				QueryPreview:               textVal("SELECT 1"),
-				TimeoutMs:                  int64Val(0),
+				Pid:                 int32Val(1234),
+				Username:            textVal("app_rw"),
+				DatabaseName:        textVal("production"),
+				ApplicationName:     textVal("myapp"),
+				State:               textVal("idle in transaction"),
+				IdleDurationSeconds: int64Val(600), // >= 5 min warn threshold
+				QueryPreview:        textVal("SELECT 1"),
 			},
 		},
 		longIdle: makeLongIdleRows(15),
 	}
 
-	checker := connectionhealth.New(mock)
+	checker := connectionhealth.New(mock, connectionhealth.DefaultConfig())
 	_, err := checker.Check(ctxWithPgVersion(17))
 
 	require.NoError(t, err)
@@ -718,14 +702,13 @@ func Test_ConnectionHealth_ReportSeverity(t *testing.T) {
 					stats: stats,
 					idleTxns: []db.IdleInTransactionRow{
 						{
-							Pid:                        int32Val(1234),
-							Username:                   textVal("app_rw"),
-							DatabaseName:               textVal("production"),
-							ApplicationName:            textVal("myapp"),
-							State:                      textVal("idle in transaction"),
-							TransactionDurationSeconds: int64Val(300), // >= 300s fail threshold
-							QueryPreview:               textVal("SELECT 1"),
-							TimeoutMs:                  int64Val(0),
+							Pid:                 int32Val(1234),
+							Username:            textVal("app_rw"),
+							DatabaseName:        textVal("production"),
+							ApplicationName:     textVal("myapp"),
+							State:               textVal("idle in transaction"),
+							IdleDurationSeconds: int64Val(3600), // >= 1 h fail threshold
+							QueryPreview:        textVal("SELECT 1"),
 						},
 					},
 				}
@@ -739,11 +722,130 @@ func Test_ConnectionHealth_ReportSeverity(t *testing.T) {
 			t.Parallel()
 
 			mock := tt.setupMock()
-			checker := connectionhealth.New(mock)
+			checker := connectionhealth.New(mock, connectionhealth.DefaultConfig())
 			report, err := checker.Check(ctxWithPgVersion(17))
 
 			require.NoError(t, err)
 			require.Equal(t, tt.expectedSeverity, report.Severity)
+		})
+	}
+}
+
+func Test_ConnectionHealth_StatsRestricted(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name               string
+		total              int64
+		hidden             int64
+		expectedSeverity   check.Severity
+		expectedSaturation check.Severity
+	}{
+		{
+			name:               "hidden connections report stats-restricted",
+			total:              50,
+			hidden:             45,
+			expectedSeverity:   check.SeverityWarn,
+			expectedSaturation: check.SeverityPass,
+		},
+		{
+			name:               "saturation is still graded when stats are restricted",
+			total:              90,
+			hidden:             85,
+			expectedSeverity:   check.SeverityFail,
+			expectedSaturation: check.SeverityFail,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			stats := healthyStats()
+			stats.TotalConnections = int64Val(tt.total)
+			stats.ActiveConnections = int64Val(0)
+			stats.IdleConnections = int64Val(0)
+			stats.HiddenConnections = int64Val(tt.hidden)
+			mock := &mockQueries{stats: stats}
+
+			report, err := connectionhealth.New(mock, connectionhealth.DefaultConfig()).Check(ctxWithPgVersion(17))
+			require.NoError(t, err)
+
+			require.Len(t, report.Results, 2)
+			require.True(t, hasResult(report.Results, "connection-saturation", tt.expectedSaturation))
+			require.True(t, hasResult(report.Results, "stats-restricted", check.SeverityWarn))
+			require.Contains(t, getFinding(report.Results, "stats-restricted").Details, fmt.Sprintf("%d connections from other roles", tt.hidden))
+			require.Equal(t, tt.expectedSeverity, report.Severity)
+			checktest.AssertSeverityInvariant(t, report)
+		})
+	}
+
+	t.Run("visible problems are still reported when stats are restricted", func(t *testing.T) {
+		t.Parallel()
+
+		stats := healthyStats()
+		stats.HiddenConnections = int64Val(10)
+		mock := &mockQueries{
+			stats: stats,
+			idleTxns: []db.IdleInTransactionRow{
+				{
+					Pid:                 int32Val(1234),
+					Username:            textVal("app_rw"),
+					State:               textVal("idle in transaction"),
+					IdleDurationSeconds: int64Val(3600),
+				},
+			},
+			longIdle: makeLongIdleRows(150),
+		}
+
+		report, err := connectionhealth.New(mock, connectionhealth.DefaultConfig()).Check(ctxWithPgVersion(17))
+		require.NoError(t, err)
+
+		require.Len(t, report.Results, 4)
+		require.True(t, hasResult(report.Results, "stats-restricted", check.SeverityWarn))
+		require.True(t, hasResult(report.Results, "idle-in-transaction", check.SeverityFail))
+		require.True(t, hasResult(report.Results, "long-idle", check.SeverityWarn))
+		require.Equal(t, check.SeverityFail, report.Severity)
+		checktest.AssertSeverityInvariant(t, report)
+	})
+
+	t.Run("no hidden connections runs every subcheck", func(t *testing.T) {
+		t.Parallel()
+
+		stats := healthyStats()
+		stats.HiddenConnections = int64Val(0)
+		mock := &mockQueries{stats: stats}
+
+		report, err := connectionhealth.New(mock, connectionhealth.DefaultConfig()).Check(ctxWithPgVersion(17))
+		require.NoError(t, err)
+
+		require.Len(t, report.Results, 6)
+		require.Nil(t, getFinding(report.Results, "stats-restricted"))
+	})
+}
+
+func Test_ConnectionHealth_QueryErrors(t *testing.T) {
+	t.Parallel()
+
+	queryErr := errors.New("connection refused")
+
+	tests := []struct {
+		name string
+		mock *mockQueries
+	}{
+		{name: "stats", mock: &mockQueries{statsErr: queryErr}},
+		{name: "idle-txn", mock: &mockQueries{stats: healthyStats(), idleTxnsErr: queryErr}},
+		{name: "long-idle", mock: &mockQueries{stats: healthyStats(), longIdleErr: queryErr}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			report, err := connectionhealth.New(tt.mock, connectionhealth.DefaultConfig()).Check(ctxWithPgVersion(17))
+			require.ErrorIs(t, err, queryErr)
+			require.Contains(t, err.Error(), tt.name)
+			require.Nil(t, report)
 		})
 	}
 }

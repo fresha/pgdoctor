@@ -20,14 +20,33 @@ type PKTypesQueries interface {
 	InvalidPrimaryKeyTypes(context.Context) ([]db.InvalidPrimaryKeyTypesRow, error)
 }
 
-type checker struct {
-	queries PKTypesQueries
+type Config struct {
+	UsageWarnPercent float64 `yaml:"usage_warn_percent"`
+	UsageFailPercent float64 `yaml:"usage_fail_percent"`
 }
 
-const (
-	usagePercentFail  = 85.0 // FAIL: >=85% of capacity used (urgent migration needed)
-	usagePercentFloor = 45.0 // Below this, capacity pressure is not worth reporting yet
-)
+func DefaultConfig() Config {
+	return Config{UsageWarnPercent: 50, UsageFailPercent: 90}
+}
+
+func (c Config) Validate() error {
+	if !(c.UsageWarnPercent > 0 && c.UsageWarnPercent <= 100) {
+		return fmt.Errorf("usage_warn_percent: %v is not a percent in (0, 100]", c.UsageWarnPercent)
+	}
+	if !(c.UsageFailPercent > 0 && c.UsageFailPercent <= 100) {
+		return fmt.Errorf("usage_fail_percent: %v is not a percent in (0, 100]", c.UsageFailPercent)
+	}
+	if c.UsageWarnPercent >= c.UsageFailPercent {
+		return fmt.Errorf("usage_warn_percent %v must be lower than usage_fail_percent %v", c.UsageWarnPercent, c.UsageFailPercent)
+	}
+	return nil
+}
+
+type checker struct {
+	queries          PKTypesQueries
+	usageWarnPercent float64
+	usageFailPercent float64
+}
 
 func Metadata() check.Metadata {
 	return check.Metadata{
@@ -40,9 +59,11 @@ func Metadata() check.Metadata {
 	}
 }
 
-func New(queries PKTypesQueries, _ ...check.Config) check.Checker {
+func New(queries PKTypesQueries, cfg Config) check.Checker {
 	return &checker{
-		queries: queries,
+		queries:          queries,
+		usageWarnPercent: cfg.UsageWarnPercent,
+		usageFailPercent: cfg.UsageFailPercent,
 	}
 }
 
@@ -72,10 +93,15 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 	maxSeverity := check.SeverityWarn
 	criticalCount := 0
 	warningCount := 0
+	unreadableCount := 0
 
 	for _, row := range rows {
-		entry := analyzeRow(row)
-		if entry.usagePct < usagePercentFloor {
+		if row.SequenceUnreadable.Bool {
+			unreadableCount++
+		}
+
+		entry := analyzeRow(row, c.usageFailPercent)
+		if entry.usagePct < c.usageWarnPercent {
 			continue
 		}
 
@@ -98,23 +124,30 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 			ID:       report.CheckID,
 			Name:     report.Name,
 			Severity: check.SeverityPass,
-			Details:  "All tables use bigint or UUID primary keys",
+			Details:  withUnreadableNote("All tables use bigint or UUID primary keys", unreadableCount),
 		})
-		return report, nil
+	} else {
+		report.AddFinding(check.Finding{
+			ID:       report.CheckID,
+			Name:     report.Name,
+			Severity: maxSeverity,
+			Details:  withUnreadableNote(formatDetails(criticalCount, warningCount), unreadableCount),
+			Table: &check.Table{
+				Headers: []string{"Table", "Column", "Type", "Usage %", "Rows"},
+				Rows:    tableRows,
+			},
+		})
 	}
 
-	report.AddFinding(check.Finding{
-		ID:       report.CheckID,
-		Name:     report.Name,
-		Severity: maxSeverity,
-		Details:  formatDetails(criticalCount, warningCount),
-		Table: &check.Table{
-			Headers: []string{"Table", "Column", "Type", "Usage %", "Rows"},
-			Rows:    tableRows,
-		},
-	})
-
 	return report, nil
+}
+
+func withUnreadableNote(details string, unreadableCount int) string {
+	if unreadableCount == 0 {
+		return details
+	}
+	return fmt.Sprintf("%s\n%d table(s) use the row estimate: role cannot read sequence values (needs SELECT on the sequences)",
+		details, unreadableCount)
 }
 
 type tableEntry struct {
@@ -123,18 +156,18 @@ type tableEntry struct {
 	usagePct float64
 }
 
-func analyzeRow(row db.InvalidPrimaryKeyTypesRow) tableEntry {
+func analyzeRow(row db.InvalidPrimaryKeyTypesRow, usageFailPercent float64) tableEntry {
 	usageStr, usagePct := calculateUsage(row)
 
 	return tableEntry{
 		cells: []string{
-			row.TableName.String,
-			row.ColumnName.String,
-			row.ColumnType.String,
+			row.TableName,
+			row.ColumnName,
+			row.ColumnType,
 			usageStr,
-			check.FormatNumber(row.EstimatedRows.Int64),
+			check.FormatNumber(row.EstimatedRows),
 		},
-		severity: determineSeverity(usagePct, row.EstimatedRows.Int64),
+		severity: determineSeverity(usagePct, usageFailPercent, row.SequenceCurrent.Valid),
 		usagePct: usagePct,
 	}
 }
@@ -150,8 +183,10 @@ func calculateUsage(row db.InvalidPrimaryKeyTypesRow) (string, float64) {
 	return fmt.Sprintf("~%.1f%%", pct), pct
 }
 
-func determineSeverity(usagePct float64, estRows int64) check.Severity {
-	if usagePct >= usagePercentFail {
+// A row estimate says how many ids exist, not how close the next id is to the
+// type limit, so it never reaches FAIL.
+func determineSeverity(usagePct, usageFailPercent float64, fromSequence bool) check.Severity {
+	if fromSequence && usagePct >= usageFailPercent {
 		return check.SeverityFail
 	}
 	return check.SeverityWarn

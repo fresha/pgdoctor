@@ -5,7 +5,7 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
-	"strings"
+	"math"
 
 	"github.com/fresha/pgdoctor/check"
 	"github.com/fresha/pgdoctor/db"
@@ -20,16 +20,35 @@ var readme string
 const (
 	warnRowThreshold   = 10000
 	warnRatioThreshold = 10.0
-	failRowThreshold   = 50000
-	failRatioThreshold = 50.0
 )
 
 type TableSeqScansQueries interface {
-	HighSeqScanTables(context.Context) ([]db.HighSeqScanTablesRow, error)
+	HighSeqScanTables(ctx context.Context, minRows int64) ([]db.HighSeqScanTablesRow, error)
+}
+
+type Config struct {
+	HighSeqScansMinRows  int64   `yaml:"high_seq_scans_min_rows"`
+	HighSeqScansMinRatio float64 `yaml:"high_seq_scans_min_ratio"`
+}
+
+func DefaultConfig() Config {
+	return Config{HighSeqScansMinRows: 50000, HighSeqScansMinRatio: 50}
+}
+
+func (c Config) Validate() error {
+	if c.HighSeqScansMinRows <= 0 {
+		return fmt.Errorf("high_seq_scans_min_rows: %d is not a positive integer", c.HighSeqScansMinRows)
+	}
+	if !(c.HighSeqScansMinRatio > 0) || math.IsInf(c.HighSeqScansMinRatio, 1) {
+		return fmt.Errorf("high_seq_scans_min_ratio: %v is not a positive number", c.HighSeqScansMinRatio)
+	}
+	return nil
 }
 
 type checker struct {
-	queries TableSeqScansQueries
+	queries      TableSeqScansQueries
+	highMinRows  int64
+	highMinRatio float64
 }
 
 func Metadata() check.Metadata {
@@ -43,10 +62,8 @@ func Metadata() check.Metadata {
 	}
 }
 
-func New(queries TableSeqScansQueries, _ ...check.Config) check.Checker {
-	return &checker{
-		queries: queries,
-	}
+func New(queries TableSeqScansQueries, cfg Config) check.Checker {
+	return &checker{queries: queries, highMinRows: cfg.HighSeqScansMinRows, highMinRatio: cfg.HighSeqScansMinRatio}
 }
 
 func (c *checker) Metadata() check.Metadata {
@@ -56,7 +73,7 @@ func (c *checker) Metadata() check.Metadata {
 func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 	report := check.NewReport(Metadata())
 
-	rows, err := c.queries.HighSeqScanTables(ctx)
+	rows, err := c.queries.HighSeqScanTables(ctx, min(warnRowThreshold, c.highMinRows))
 	if err != nil {
 		return nil, fmt.Errorf("running %s/%s: %w", report.Category, report.CheckID, err)
 	}
@@ -70,86 +87,70 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 		return report, nil
 	}
 
-	checkHighSeqScans(rows, report)
+	checkHighSeqScans(rows, c.highMinRows, c.highMinRatio, report)
 
 	return report, nil
 }
 
-func checkHighSeqScans(rows []db.HighSeqScanTablesRow, report *check.Report) {
-	var failTables []string
-	var warnTables []string
-	failCount := 0
-	warnCount := 0
+func checkHighSeqScans(rows []db.HighSeqScanTablesRow, highMinRows int64, highMinRatio float64, report *check.Report) {
+	var failRows []check.TableRow
+	var warnRows []check.TableRow
 
 	for _, row := range rows {
 		if row.IndexCount.Int64 == 0 {
 			continue
 		}
 
+		noIndexScans := !row.SeqToIdxRatio.Valid
 		var ratio float64
-		if row.SeqToIdxRatio.Valid {
+		ratioCell := "no index scans"
+		if !noIndexScans {
 			r, _ := row.SeqToIdxRatio.Float64Value()
 			ratio = r.Float64
-		} else {
-			ratio = 999999
+			ratioCell = fmt.Sprintf("%.1f", ratio)
 		}
 
-		sizeMB := float64(row.TableSizeBytes.Int64) / (1024 * 1024)
+		cells := []string{
+			row.TableName.String,
+			check.FormatNumber(row.SeqScan.Int64),
+			check.FormatNumber(row.IdxScan.Int64),
+			ratioCell,
+			check.FormatNumber(row.EstimatedRows.Int64),
+			check.FormatBytes(row.TableSizeBytes.Int64),
+		}
 
-		if row.EstimatedRows.Int64 >= failRowThreshold && ratio >= failRatioThreshold {
-			failCount++
-			if len(failTables) < 10 {
-				failTables = append(failTables, fmt.Sprintf("%s (seq: %d, idx: %d, ratio: %.1f, rows: %d, size: %.1f MB)",
-					row.TableName.String, row.SeqScan.Int64, row.IdxScan.Int64, ratio, row.EstimatedRows.Int64, sizeMB))
-			}
-		} else if row.EstimatedRows.Int64 >= warnRowThreshold && ratio >= warnRatioThreshold {
-			warnCount++
-			if len(warnTables) < 10 {
-				warnTables = append(warnTables, fmt.Sprintf("%s (seq: %d, idx: %d, ratio: %.1f, rows: %d, size: %.1f MB)",
-					row.TableName.String, row.SeqScan.Int64, row.IdxScan.Int64, ratio, row.EstimatedRows.Int64, sizeMB))
-			}
+		if row.EstimatedRows.Int64 >= highMinRows && (noIndexScans || ratio >= highMinRatio) {
+			failRows = append(failRows, check.TableRow{Cells: cells, Severity: check.SeverityFail})
+		} else if row.EstimatedRows.Int64 >= warnRowThreshold && (noIndexScans || ratio >= warnRatioThreshold) {
+			warnRows = append(warnRows, check.TableRow{Cells: cells, Severity: check.SeverityWarn})
 		}
 	}
 
-	if failCount > 0 {
-		details := fmt.Sprintf("Found %d tables with very high sequential scan ratios:\n%s",
-			failCount,
-			strings.Join(failTables, "\n"),
-		)
-		if failCount > len(failTables) {
-			details += fmt.Sprintf("\n... and %d more", failCount-len(failTables))
-		}
+	headers := []string{"Table", "Seq Scans", "Idx Scans", "Ratio", "Rows", "Size"}
 
+	if len(failRows) > 0 {
 		report.AddFinding(check.Finding{
 			ID:       "high-seq-scans",
 			Name:     "High Sequential Scans",
 			Severity: check.SeverityFail,
-			Details:  details,
+			Details:  fmt.Sprintf("Found %d tables with very high sequential scan ratios", len(failRows)),
+			Table:    &check.Table{Headers: headers, Rows: failRows},
 		})
-	}
-
-	if warnCount > 0 {
-		details := fmt.Sprintf("Found %d tables with elevated sequential scan ratios:\n%s",
-			warnCount,
-			strings.Join(warnTables, "\n"),
-		)
-		if warnCount > len(warnTables) {
-			details += fmt.Sprintf("\n... and %d more", warnCount-len(warnTables))
-		}
-
-		report.AddFinding(check.Finding{
-			ID:       "moderate-seq-scans",
-			Name:     "Moderate Sequential Scans",
-			Severity: check.SeverityWarn,
-			Details:  details,
-		})
-	}
-
-	if failCount == 0 && warnCount == 0 {
+	} else {
 		report.AddFinding(check.Finding{
 			ID:       "high-seq-scans",
 			Name:     "High Sequential Scans",
 			Severity: check.SeverityPass,
+		})
+	}
+
+	if len(warnRows) > 0 {
+		report.AddFinding(check.Finding{
+			ID:       "moderate-seq-scans",
+			Name:     "Moderate Sequential Scans",
+			Severity: check.SeverityWarn,
+			Details:  fmt.Sprintf("Found %d tables with elevated sequential scan ratios", len(warnRows)),
+			Table:    &check.Table{Headers: headers, Rows: warnRows},
 		})
 	}
 }

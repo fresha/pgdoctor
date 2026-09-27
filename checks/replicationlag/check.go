@@ -5,6 +5,7 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"math"
 
 	"github.com/fresha/pgdoctor/check"
 	"github.com/fresha/pgdoctor/db"
@@ -17,21 +18,14 @@ var querySQL string
 var readme string
 
 const (
-	// Physical replication thresholds (streaming replication to standbys).
-	// Strict thresholds because physical standbys should be near-synchronous.
-	physicalWarnSeconds = 0.25 // 250ms
-	physicalFailSeconds = 1.0  // 1 second
-
 	// Logical replication thresholds (CDC/Debezium, selective replication).
 	//
 	// Absolute liveness tier: replay_lag time tracks Debezium's ack cadence, not
-	// danger — the real risk is slot backlog bytes. WARN/FAIL therefore require
+	// danger — the real risk is slot backlog bytes. WARN therefore requires
 	// BOTH high time AND high bytes; time alone (small backlog) is normal batch
 	// behaviour.
-	logicalWarnSeconds = 120.0             // 2 minutes
-	logicalFailSeconds = 300.0             // 5 minutes
-	logicalWarnBytes   = int64(576716800)  // 550 MiB
-	logicalFailBytes   = int64(2147483648) // 2 GiB
+	logicalWarnSeconds = 120.0            // 2 minutes
+	logicalWarnBytes   = int64(576716800) // 550 MiB
 
 	// Capacity-relative tier: when max_slot_wal_keep_size is a real cap (> 0), the
 	// backlog as a fraction of that budget is a danger signal independent of time.
@@ -50,8 +44,51 @@ type ReplicationLagQueries interface {
 	ReplicationLag(context.Context) ([]db.ReplicationLagRow, error)
 }
 
+type Config struct {
+	PhysicalLagWarnSeconds   float64                  `yaml:"physical_lag_warn_seconds"`
+	PhysicalLagFailSeconds   float64                  `yaml:"physical_lag_fail_seconds"`
+	PhysicalLagByApplication map[string]LagThresholds `yaml:"physical_lag_by_application"`
+}
+
+// LagThresholds replaces the global pair for one replica.
+type LagThresholds struct {
+	WarnSeconds float64 `yaml:"warn_seconds"`
+	FailSeconds float64 `yaml:"fail_seconds"`
+}
+
+func DefaultConfig() Config {
+	return Config{PhysicalLagWarnSeconds: 5, PhysicalLagFailSeconds: 60}
+}
+
+func (c Config) Validate() error {
+	if err := validatePair(c.PhysicalLagWarnSeconds, c.PhysicalLagFailSeconds); err != nil {
+		return err
+	}
+	for name, t := range c.PhysicalLagByApplication {
+		if err := validatePair(t.WarnSeconds, t.FailSeconds); err != nil {
+			return fmt.Errorf("physical_lag_by_application.%s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func validatePair(warn, fail float64) error {
+	if !positive(warn) || !positive(fail) {
+		return fmt.Errorf("thresholds must be positive numbers")
+	}
+	if warn >= fail {
+		return fmt.Errorf("warn %v must be lower than fail %v", warn, fail)
+	}
+	return nil
+}
+
+func positive(n float64) bool {
+	return n > 0 && !math.IsInf(n, 1)
+}
+
 type checker struct {
 	queries ReplicationLagQueries
+	cfg     Config
 }
 
 func Metadata() check.Metadata {
@@ -65,10 +102,8 @@ func Metadata() check.Metadata {
 	}
 }
 
-func New(queries ReplicationLagQueries, _ ...check.Config) check.Checker {
-	return &checker{
-		queries: queries,
-	}
+func New(queries ReplicationLagQueries, cfg Config) check.Checker {
+	return &checker{queries: queries, cfg: cfg}
 }
 
 func (c *checker) Metadata() check.Metadata {
@@ -109,7 +144,7 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 	}
 
 	if len(physicalRows) > 0 {
-		checkPhysicalReplicationLag(physicalRows, report)
+		c.checkPhysicalReplicationLag(physicalRows, report)
 	}
 
 	if len(logicalRows) > 0 {
@@ -119,19 +154,32 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 	return report, nil
 }
 
-func checkPhysicalReplicationLag(rows []db.ReplicationLagRow, report *check.Report) {
+func (c *checker) physicalLagSeverity(row db.ReplicationLagRow) check.Severity {
+	warn, fail := c.cfg.PhysicalLagWarnSeconds, c.cfg.PhysicalLagFailSeconds
+	if t, ok := c.cfg.PhysicalLagByApplication[row.ApplicationName.String]; ok {
+		warn, fail = t.WarnSeconds, t.FailSeconds
+	}
+	// COALESCE in query ensures these are always valid
+	lagSeconds := row.ReplayLagSeconds.Float64
+	switch {
+	case lagSeconds >= fail:
+		return check.SeverityFail
+	case lagSeconds >= warn:
+		return check.SeverityWarn
+	default:
+		return check.SeverityPass
+	}
+}
+
+func (c *checker) checkPhysicalReplicationLag(rows []db.ReplicationLagRow, report *check.Report) {
 	var laggingRows []db.ReplicationLagRow
 	maxSeverity := check.SeverityPass
 
 	for _, row := range rows {
-		// COALESCE in query ensures these are always valid
-		lagSeconds := row.ReplayLagSeconds.Float64
-		if lagSeconds >= physicalWarnSeconds {
+		if severity := c.physicalLagSeverity(row); severity != check.SeverityPass {
 			laggingRows = append(laggingRows, row)
-			if lagSeconds >= physicalFailSeconds {
-				maxSeverity = check.SeverityFail
-			} else if maxSeverity != check.SeverityFail {
-				maxSeverity = check.SeverityWarn
+			if severity > maxSeverity {
+				maxSeverity = severity
 			}
 		}
 	}
@@ -148,13 +196,6 @@ func checkPhysicalReplicationLag(rows []db.ReplicationLagRow, report *check.Repo
 
 	var tableRows []check.TableRow
 	for _, row := range laggingRows {
-		// COALESCE in query ensures these are always valid
-		lagSeconds := row.ReplayLagSeconds.Float64
-		severity := check.SeverityWarn
-		if lagSeconds >= physicalFailSeconds {
-			severity = check.SeverityFail
-		}
-
 		slotName := row.SlotName.String
 		if slotName == "" {
 			slotName = "[no slot]"
@@ -164,11 +205,11 @@ func checkPhysicalReplicationLag(rows []db.ReplicationLagRow, report *check.Repo
 			Cells: []string{
 				row.ApplicationName.String,
 				row.State.String,
-				fmt.Sprintf("%.2fs", lagSeconds),
+				fmt.Sprintf("%.2fs", row.ReplayLagSeconds.Float64),
 				check.FormatBytes(row.ReplayLagBytes.Int64),
 				slotName,
 			},
-			Severity: severity,
+			Severity: c.physicalLagSeverity(row),
 		})
 	}
 
@@ -185,7 +226,7 @@ func checkPhysicalReplicationLag(rows []db.ReplicationLagRow, report *check.Repo
 }
 
 // logicalLagSeverity is the MAX of two independent tiers. The absolute liveness
-// tier gates on BOTH time AND bytes (high time with a small backlog is normal
+// tier (WARN at most) gates on BOTH time AND bytes (high time with a small backlog is normal
 // Debezium batching). The capacity-relative tier — active only when capBytes is a
 // real cap (> 0) — compares the backlog against a fraction of max_slot_wal_keep_size
 // regardless of time, catching a slot approaching its retention budget before
@@ -199,9 +240,6 @@ func logicalLagSeverity(timeSec float64, bytes, capBytes int64) check.Severity {
 }
 
 func logicalAbsoluteSeverity(timeSec float64, bytes int64) check.Severity {
-	if timeSec >= logicalFailSeconds && bytes >= logicalFailBytes {
-		return check.SeverityFail
-	}
 	if timeSec >= logicalWarnSeconds && bytes >= logicalWarnBytes {
 		return check.SeverityWarn
 	}

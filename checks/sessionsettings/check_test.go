@@ -250,7 +250,7 @@ func Test_SessionSettings(t *testing.T) {
 
 			queryer := newStaticSessionSettingsQueryer(tc.Rows)
 
-			checker := sessionsettings.New(queryer)
+			checker := sessionsettings.New(queryer, sessionsettings.DefaultConfig())
 			report, err := checker.Check(context.Background())
 			require.NoError(t, err)
 			checktest.AssertSeverityInvariant(t, report)
@@ -291,7 +291,7 @@ func Test_SessionSettings_MultipleIssues(t *testing.T) {
 
 	queryer := newStaticSessionSettingsQueryer(mapToSessionSettingsRows(settings))
 
-	checker := sessionsettings.New(queryer)
+	checker := sessionsettings.New(queryer, sessionsettings.DefaultConfig())
 	report, err := checker.Check(context.Background())
 	require.NoError(t, err)
 	checktest.AssertSeverityInvariant(t, report)
@@ -320,7 +320,7 @@ func Test_SessionSettings_BothRolesCheckedEqually(t *testing.T) {
 
 	queryer := newStaticSessionSettingsQueryer(settings)
 
-	checker := sessionsettings.New(queryer)
+	checker := sessionsettings.New(queryer, sessionsettings.DefaultConfig())
 	report, err := checker.Check(context.Background())
 	require.NoError(t, err)
 	checktest.AssertSeverityInvariant(t, report)
@@ -397,7 +397,7 @@ func Test_SessionSettings_SpecificDetailChecks(t *testing.T) {
 
 			queryer := newStaticSessionSettingsQueryer(tc.Rows)
 
-			checker := sessionsettings.New(queryer)
+			checker := sessionsettings.New(queryer, sessionsettings.DefaultConfig())
 			report, err := checker.Check(context.Background())
 			require.NoError(t, err)
 			checktest.AssertSeverityInvariant(t, report)
@@ -431,7 +431,7 @@ func Test_SessionSettings_EmptyRoles(t *testing.T) {
 
 	queryer := newStaticSessionSettingsQueryer([]db.SessionSettingsRow{})
 
-	checker := sessionsettings.New(queryer)
+	checker := sessionsettings.New(queryer, sessionsettings.DefaultConfig())
 	report, err := checker.Check(context.Background())
 	require.NoError(t, err)
 	checktest.AssertSeverityInvariant(t, report)
@@ -464,7 +464,7 @@ func Test_SessionSettings_ArbitraryRoleNames(t *testing.T) {
 
 	queryer := newStaticSessionSettingsQueryer(mapToSessionSettingsRows(settings))
 
-	checker := sessionsettings.New(queryer)
+	checker := sessionsettings.New(queryer, sessionsettings.DefaultConfig())
 	report, err := checker.Check(context.Background())
 	require.NoError(t, err)
 	checktest.AssertSeverityInvariant(t, report)
@@ -472,47 +472,6 @@ func Test_SessionSettings_ArbitraryRoleNames(t *testing.T) {
 	results := report.Results
 	require.Equal(t, 1, len(results), "Should have exactly 1 result")
 	require.Equal(t, check.SeverityPass, results[0].Severity, "Arbitrary role names with optimal settings should be OK")
-}
-
-func Test_SessionSettings_ConfiguredRoleMissing(t *testing.T) {
-	t.Parallel()
-
-	settings := map[string]map[string]string{
-		"api_user": {
-			"statement_timeout":                   "3000",
-			"idle_in_transaction_session_timeout": "60000",
-			"transaction_timeout":                 "3000",
-			"log_min_duration_statement":          "2000",
-		},
-	}
-
-	cfg := check.Config{
-		"session-settings": {"roles": "api_user,nonexistent"},
-	}
-
-	queryer := newStaticSessionSettingsQueryer(mapToSessionSettingsRows(settings))
-
-	checker := sessionsettings.New(queryer, cfg)
-	report, err := checker.Check(context.Background())
-	require.NoError(t, err)
-	checktest.AssertSeverityInvariant(t, report)
-
-	results := report.Results
-	require.Equal(t, 1, len(results), "Should have exactly 1 result")
-
-	result := results[0]
-	require.Equal(t, check.SeverityWarn, result.Severity, "Missing configured role should warn")
-	require.NotNil(t, result.Table, "Result should have a table")
-
-	// Find the "Role not found" row
-	var foundRow *check.TableRow
-	for _, row := range result.Table.Rows {
-		if len(row.Cells) >= 5 && row.Cells[0] == "nonexistent" && row.Cells[4] == "Role not found" {
-			foundRow = &row
-			break
-		}
-	}
-	require.NotNil(t, foundRow, "Should find 'Role not found' row for nonexistent role")
 }
 
 func Test_SessionSettings_CustomThreshold(t *testing.T) {
@@ -528,12 +487,7 @@ func Test_SessionSettings_CustomThreshold(t *testing.T) {
 		},
 	}
 
-	cfg := check.Config{
-		"session-settings": {
-			"roles":   "app_ro",
-			"timeout": "2000",
-		},
-	}
+	cfg := sessionsettings.Config{Timeout: 2000}
 
 	queryer := newStaticSessionSettingsQueryer(mapToSessionSettingsRows(settings))
 	checker := sessionsettings.New(queryer, cfg)
@@ -570,7 +524,7 @@ func Test_SessionSettings_DefaultThreshold(t *testing.T) {
 	}
 
 	queryer := newStaticSessionSettingsQueryer(mapToSessionSettingsRows(settings))
-	checker := sessionsettings.New(queryer)
+	checker := sessionsettings.New(queryer, sessionsettings.DefaultConfig())
 	report, err := checker.Check(context.Background())
 	require.NoError(t, err)
 	checktest.AssertSeverityInvariant(t, report)
@@ -584,7 +538,7 @@ func Test_SessionSettings_DefaultThreshold(t *testing.T) {
 	}
 }
 
-func Test_SessionSettings_ConfigOverridesDiscovery(t *testing.T) {
+func Test_SessionSettings_IgnoreRoles(t *testing.T) {
 	t.Parallel()
 
 	// DB has both api_user and worker_user
@@ -603,10 +557,8 @@ func Test_SessionSettings_ConfigOverridesDiscovery(t *testing.T) {
 		},
 	}
 
-	// Config only specifies api_user — worker_user should be ignored
-	cfg := check.Config{
-		"session-settings": {"roles": "api_user"},
-	}
+	cfg := sessionsettings.DefaultConfig()
+	cfg.IgnoreRoles = []string{"worker_user", "", "nonexistent"}
 
 	queryer := newStaticSessionSettingsQueryer(mapToSessionSettingsRows(settings))
 
@@ -618,6 +570,110 @@ func Test_SessionSettings_ConfigOverridesDiscovery(t *testing.T) {
 	results := report.Results
 	require.Equal(t, 1, len(results), "Should have exactly 1 result")
 
-	// Only api_user is checked (which has good settings), worker_user is ignored
-	require.Equal(t, check.SeverityPass, results[0].Severity, "Should only check configured roles")
+	require.Equal(t, check.SeverityPass, results[0].Severity, "Should skip ignored roles")
+}
+
+func Test_SessionSettings_RoleTimeout(t *testing.T) {
+	t.Parallel()
+
+	settings := map[string]map[string]string{
+		"app_rw": {
+			"statement_timeout":                   "3000",
+			"idle_in_transaction_session_timeout": "60000",
+			"transaction_timeout":                 "3000",
+			"log_min_duration_statement":          "2000",
+		},
+		"dba_ro": {
+			"statement_timeout":                   "300000",
+			"idle_in_transaction_session_timeout": "60000",
+			"transaction_timeout":                 "300000",
+			"log_min_duration_statement":          "2000",
+		},
+	}
+
+	testCases := []struct {
+		Name     string
+		Cfg      sessionsettings.Config
+		Severity check.Severity
+		Expected map[string]string
+	}{
+		{
+			Name:     "no config grades every role on the default",
+			Cfg:      sessionsettings.DefaultConfig(),
+			Severity: check.SeverityWarn,
+			Expected: map[string]string{
+				"dba_ro/statement_timeout":   "≤ 5000ms",
+				"dba_ro/transaction_timeout": "≤ 5000ms",
+			},
+		},
+		{
+			Name:     "override for one role, default for the other",
+			Cfg:      sessionsettings.Config{Timeout: 5000, TimeoutByRole: map[string]int64{"dba_ro": 300000}},
+			Severity: check.SeverityPass,
+		},
+		{
+			Name:     "override below the role value warns with the role threshold",
+			Cfg:      sessionsettings.Config{Timeout: 2000, TimeoutByRole: map[string]int64{"dba_ro": 60000}},
+			Severity: check.SeverityWarn,
+			Expected: map[string]string{
+				"app_rw/statement_timeout":   "≤ 2000ms",
+				"app_rw/transaction_timeout": "≤ 2000ms",
+				"dba_ro/statement_timeout":   "≤ 60000ms",
+				"dba_ro/transaction_timeout": "≤ 60000ms",
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.Name, func(t *testing.T) {
+			t.Parallel()
+
+			queryer := newStaticSessionSettingsQueryer(mapToSessionSettingsRows(settings))
+			checker := sessionsettings.New(queryer, tc.Cfg)
+			report, err := checker.Check(context.Background())
+			require.NoError(t, err)
+			checktest.AssertSeverityInvariant(t, report)
+
+			result := report.Results[0]
+			require.Equal(t, tc.Severity, result.Severity)
+			if tc.Severity == check.SeverityPass {
+				return
+			}
+
+			got := map[string]string{}
+			for _, row := range result.Table.Rows {
+				require.Equal(t, "Too high", row.Cells[4])
+				got[row.Cells[0]+"/"+row.Cells[1]] = row.Cells[3]
+			}
+			require.Equal(t, tc.Expected, got)
+		})
+	}
+}
+
+func TestConfig_Validate(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		cfg     sessionsettings.Config
+		wantErr bool
+	}{
+		{"defaults", sessionsettings.DefaultConfig(), false},
+		{"zero timeout", sessionsettings.Config{}, true},
+		{"negative role timeout", sessionsettings.Config{Timeout: 5000, TimeoutByRole: map[string]int64{"dba_ro": -1}}, true},
+		{"empty ignored role", sessionsettings.Config{Timeout: 5000, IgnoreRoles: []string{""}}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := tt.cfg.Validate()
+			if tt.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
 }

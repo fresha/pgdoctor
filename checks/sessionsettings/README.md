@@ -2,7 +2,7 @@
 
 Verifies that PostgreSQL role-level session settings (timeouts and logging) are properly configured for application roles.
 
-By default, application roles are **discovered dynamically** — any login-capable, non-system role is checked. You can also specify exact roles via configuration (see Library Configuration below).
+By default, application roles are **discovered dynamically** — any login-capable, non-system role is checked. You can skip roles via configuration (see Configuration below).
 
 ## What it checks
 
@@ -45,6 +45,8 @@ Common production problems caused by misconfigured settings:
 - Inability to identify performance regressions
 
 ## How to Fix
+
+### For `session-settings`
 
 Configure role settings using `ALTER ROLE`:
 
@@ -97,26 +99,38 @@ WHERE r.rolcanlogin = true
 - Consider application deployment to cycle connections
 - Monitor application error rates after changes
 
-## Library Configuration
-
-When using pgdoctor as a library, you can configure roles and timeout thresholds:
-
-```go
-cfg := check.Config{
-    "session-settings": {
-        "roles":   "app_ro,app_rw",
-        "timeout": "2000",   // above this → "Too high" WARN (default: 5000)
-    },
-}
-pgdoctor.Run(ctx, conn, pgdoctor.Options{
-    Config: cfg,
-})
-```
+## Configuration
 
 | Key | Description | Default |
 |-----|-------------|---------|
-| `roles` | Comma-separated list of roles to check | Discovered dynamically |
-| `timeout` | Threshold (ms) above which the timeouts are a `Too high` WARN | `5000` |
+| `ignore_roles` | List of discovered roles that the check skips | None |
+| `timeout` | Threshold (ms) above which `statement_timeout` and `transaction_timeout` are a `Too high` WARN | `5000` |
+| `timeout_by_role` | A map from role to threshold (ms) for that role, in place of `timeout` | None |
+
+A role that is not in `timeout_by_role` uses `timeout`. A timeout value that is not a positive integer is an error. pgdoctor ignores an empty item in `ignore_roles`. Use a per-role threshold for a human or diagnostic role that has a longer timeout on purpose.
+
+```yaml
+session-settings:
+  ignore_roles:
+    - migrations
+  timeout: 2000
+  timeout_by_role:
+    dba_ro: 300000
+```
+
+As a library, pass a `sessionsettings.Config` in `check.Config`:
+
+```go
+cfg := sessionsettings.Config{
+    IgnoreRoles:   []string{"migrations"},
+    Timeout:       2000,
+    TimeoutByRole: map[string]int64{"dba_ro": 300000},
+}
+pgdoctor.Run(ctx, conn, pgdoctor.Options{
+    Checks: pgdoctor.AllChecks(),
+    Config: check.Config{"session-settings": cfg},
+})
+```
 
 When no config is provided, roles are discovered dynamically and default thresholds apply.
 

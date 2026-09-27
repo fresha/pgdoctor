@@ -13,7 +13,7 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -33,10 +33,11 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         if: steps.check.outputs.exists == 'false'
         with:
-          go-version-file: go.mod
+          go-version: stable
+          check-latest: true
 
       - name: Create and push tag
         if: steps.check.outputs.exists == 'false'
@@ -56,7 +57,7 @@ jobs:
 
       - name: Run GoReleaser
         if: steps.check.outputs.exists == 'false'
-        uses: goreleaser/goreleaser-action@v6
+        uses: goreleaser/goreleaser-action@v7
         with:
           version: latest
           args: release --clean --release-notes=${{ runner.temp }}/release-notes.md

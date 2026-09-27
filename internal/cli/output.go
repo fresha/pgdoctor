@@ -49,12 +49,29 @@ func printCheckSummary(w io.Writer, report *check.Report, opts *runOptions) {
 		}
 	}
 
-	fmt.Fprintf(w, "%s %s %s %s%s\n",
+	var tallyStr string
+	if total > 0 {
+		tallyStr = " " + dimFunc(fmt.Sprintf("(%d/%d)", okCount, total))
+	}
+
+	fmt.Fprintf(w, "%s %s %s%s%s\n",
 		colorFunc(fmt.Sprintf("[%s]", label)),
 		report.Name,
 		dimFunc(fmt.Sprintf("(%s)", report.CheckID)),
-		dimFunc(fmt.Sprintf("(%d/%d)", okCount, total)),
+		tallyStr,
 		timingStr)
+}
+
+func hidden(report *check.Report, opts *runOptions) bool {
+	if !opts.hidePassing || report.Severity != check.SeverityPass {
+		return false
+	}
+	for _, result := range report.Results {
+		if result.Severity != check.SeverityPass {
+			return false
+		}
+	}
+	return true
 }
 
 func printCheckReport(w io.Writer, report *check.Report, opts *runOptions) {
@@ -87,7 +104,7 @@ func printCheckReport(w io.Writer, report *check.Report, opts *runOptions) {
 			result.Name,
 			dimFunc(fmt.Sprintf("(%s)", report.CheckID)),
 			timingStr)
-		if result.Severity != check.SeverityPass && result.Details != "" {
+		if result.Details != "" && (result.Severity != check.SeverityPass || showTiming(opts)) {
 			fmt.Fprintf(w, "%s\n", indent(result.Details, 2))
 		}
 		if result.Table != nil {
@@ -116,6 +133,9 @@ func printCheckReport(w io.Writer, report *check.Report, opts *runOptions) {
 		})
 
 		for _, result := range sortedResults {
+			if opts.hidePassing && result.Severity == check.SeverityPass {
+				continue
+			}
 			printSubcheck(w, report, result, opts)
 		}
 	}
@@ -141,7 +161,7 @@ func printSubcheck(w io.Writer, report *check.Report, result check.Finding, opts
 		result.Name,
 		dimFunc(fmt.Sprintf("(%s)", fullID)))
 
-	if result.Severity != check.SeverityPass && result.Details != "" {
+	if result.Details != "" && (result.Severity != check.SeverityPass || showTiming(opts)) {
 		fmt.Fprintf(w, "%s\n", indent(result.Details, 2))
 	}
 
@@ -221,15 +241,6 @@ func printTable(w io.Writer, table *check.Table, indentSpaces int, opts *runOpti
 	}
 }
 
-func hasInfoFinding(report *check.Report) bool {
-	for _, result := range report.Results {
-		if result.Severity == check.SeverityInfo {
-			return true
-		}
-	}
-	return false
-}
-
 func printSummary(w io.Writer, reports []*check.Report) {
 	okCount, warnCount, failCount, skipCount, infoCount := 0, 0, 0, 0, 0
 	var totalDuration time.Duration
@@ -237,13 +248,7 @@ func printSummary(w io.Writer, reports []*check.Report) {
 		totalDuration += report.Duration
 		switch report.Severity {
 		case check.SeverityPass:
-			// A report starts at PASS and an INFO finding never raises it, so the
-			// info tally has to come from the findings.
-			if hasInfoFinding(report) {
-				infoCount++
-			} else {
-				okCount++
-			}
+			okCount++
 		case check.SeverityWarn:
 			warnCount++
 		case check.SeverityFail:
@@ -259,10 +264,10 @@ func printSummary(w io.Writer, reports []*check.Report) {
 
 	var summaryParts []string
 	if failCount > 0 {
-		summaryParts = append(summaryParts, colorForSeverity(check.SeverityFail)(fmt.Sprintf("%d failures", failCount)))
+		summaryParts = append(summaryParts, colorForSeverity(check.SeverityFail)(plural(failCount, "failure")))
 	}
 	if warnCount > 0 {
-		summaryParts = append(summaryParts, colorForSeverity(check.SeverityWarn)(fmt.Sprintf("%d warnings", warnCount)))
+		summaryParts = append(summaryParts, colorForSeverity(check.SeverityWarn)(plural(warnCount, "warning")))
 	}
 	if okCount > 0 {
 		summaryParts = append(summaryParts, colorForSeverity(check.SeverityPass)(fmt.Sprintf("%d passed", okCount)))
@@ -276,8 +281,15 @@ func printSummary(w io.Writer, reports []*check.Report) {
 
 	dimFunc := dimColor()
 	fmt.Fprintf(w, "Summary: %s %s\n", strings.Join(summaryParts, ", "),
-		dimFunc(fmt.Sprintf("(%d checks in %s)", len(reports), check.FormatDurationMs(float64(totalDuration.Milliseconds())))))
+		dimFunc(fmt.Sprintf("(%s in %s)", plural(len(reports), "check"), check.FormatDurationMs(float64(totalDuration.Milliseconds())))))
 	fmt.Fprintln(w)
+}
+
+func plural(n int, word string) string {
+	if n == 1 {
+		return fmt.Sprintf("%d %s", n, word)
+	}
+	return fmt.Sprintf("%d %ss", n, word)
 }
 
 func severityDisplay(severity check.Severity) (string, func(string) string) {

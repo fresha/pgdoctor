@@ -81,7 +81,7 @@ const (
 	defaultMultixactFailsafeAge  = int64(1_600_000_000)
 )
 
-const unknownSize = "unknown"
+const unknownSize = "-"
 
 type FreezeAgeQueries interface {
 	DatabaseFreezeAge(context.Context) (db.DatabaseFreezeAgeRow, error)
@@ -104,7 +104,7 @@ func Metadata() check.Metadata {
 	}
 }
 
-func New(queries FreezeAgeQueries, _ ...check.Config) check.Checker {
+func New(queries FreezeAgeQueries) check.Checker {
 	return &checker{
 		queries: queries,
 	}

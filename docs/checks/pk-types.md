@@ -36,22 +36,37 @@ This check identifies **ALL** tables using `int4` (integer) or `int2` (smallint)
 
 ## Severity Thresholds
 
-Tables with int4/int2 primary keys are reported once capacity usage reaches 45%. Severity indicates migration urgency:
+Tables with int4/int2 primary keys are reported once capacity usage reaches 50% (see Configuration). Severity indicates migration urgency:
 
-- **FAIL (≥85% capacity)**: Urgent migration required
+- **FAIL (≥90% capacity)**: Urgent migration required
   - Tables are approaching exhaustion
   - Migration complexity increases with size
   - Risk of emergency downtime if not addressed
 
-- **WARN (45-85% capacity)**: Migration needed, less urgent
+- **WARN (50-90% capacity)**: Migration needed, less urgent
   - Architectural violation must be fixed
-  - Migrate proactively before reaching 85%
+  - Migrate proactively before reaching 90%
   - Easier migration when table is smaller
 
 **Usage % calculation:**
 - Uses actual sequence value when available (most accurate)
-- Falls back to estimated row count vs type max value
+- Falls back to estimated row count vs type max value. A row count does not show the position of the next id, so this estimate gives WARN, never FAIL
 - Always available (only NULL for empty tables)
+
+## Configuration
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `usage_warn_percent` | Capacity usage at which a table is reported | `50` |
+| `usage_fail_percent` | Capacity usage at which a table is FAIL | `90` |
+
+Each value must be a number greater than 0 and at most 100, and `usage_warn_percent` must be less than `usage_fail_percent`. Other values are an error. These keys do not change `sequence-health`.
+
+```yaml
+pk-types:
+  usage_warn_percent: 40
+  usage_fail_percent: 75
+```
 
 ## Architecture Rationale
 
@@ -95,6 +110,16 @@ COMMIT;
 **Lock duration:** ~1ms per 1,000 rows (100K rows ≈ 100ms downtime)
 
 For large tables (>1M rows), complex foreign key relationships, or zero-downtime requirements, see detailed migration strategies in the "Migration Guide" section below.
+
+When the finding says that some tables use the row estimate, the role cannot read the current value of their sequences. `pg_monitor` does not give this privilege. `SELECT` on a sequence lets the role read its value, but not advance it:
+
+```sql
+GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO monitoring_role;
+
+-- Also cover sequences that app_owner creates later
+ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public
+  GRANT SELECT ON SEQUENCES TO monitoring_role;
+```
 
 ## Migration Guide
 

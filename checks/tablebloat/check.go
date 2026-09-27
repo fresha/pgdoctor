@@ -35,7 +35,7 @@ func Metadata() check.Metadata {
 	}
 }
 
-func New(queries TableBloatQueries, _ ...check.Config) check.Checker {
+func New(queries TableBloatQueries) check.Checker {
 	return &checker{
 		queries: queries,
 	}
@@ -156,13 +156,16 @@ func checkLargeBloatedTables(rows []db.TableBloatRow, report *check.Report) {
 
 	for _, row := range bloated {
 		pct := getDeadTuplePercent(row)
-		wastedBytes := int64(float64(row.TotalSizeBytes.Int64) * pct / 100)
+		wasted := "-"
+		if row.HeapSizeBytes.Valid {
+			wasted = check.FormatBytes(int64(float64(row.HeapSizeBytes.Int64) * pct / 100))
+		}
 		tableRows = append(tableRows, check.TableRow{
 			Cells: []string{
 				row.TableName.String,
 				check.FormatBytes(row.TotalSizeBytes.Int64),
 				fmt.Sprintf("%.1f%%", pct),
-				check.FormatBytes(wastedBytes),
+				wasted,
 			},
 			Severity: check.SeverityWarn,
 		})

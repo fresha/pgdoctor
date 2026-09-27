@@ -24,15 +24,32 @@ type TableVacuumHealthQueries interface {
 	TableVacuumHealth(context.Context) ([]db.TableVacuumHealthRow, error)
 }
 
+type Config struct {
+	IgnoreTables []string `yaml:"ignore_tables"`
+}
+
+func DefaultConfig() Config {
+	return Config{}
+}
+
+func (c Config) Validate() error {
+	for _, prefix := range c.IgnoreTables {
+		if prefix == "" {
+			return fmt.Errorf("ignore_tables: empty prefix")
+		}
+	}
+	return nil
+}
+
 type checker struct {
-	queries TableVacuumHealthQueries
+	queries                    TableVacuumHealthQueries
+	autovacuumDisabledExcludes []string
 }
 
 const (
 	largeTableMinRows = 1_000_000
 
 	defaultVacuumScaleFactor = 0.2
-	defaultVacuumThreshold   = 50
 
 	secondsPerDay = 24 * 60 * 60
 	secondsPerHr  = 60 * 60
@@ -62,10 +79,8 @@ func Metadata() check.Metadata {
 	}
 }
 
-func New(queries TableVacuumHealthQueries, _ ...check.Config) check.Checker {
-	return &checker{
-		queries: queries,
-	}
+func New(queries TableVacuumHealthQueries, cfg Config) check.Checker {
+	return &checker{queries: queries, autovacuumDisabledExcludes: cfg.IgnoreTables}
 }
 
 func (c *checker) Metadata() check.Metadata {
@@ -80,7 +95,7 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 		return nil, fmt.Errorf("running %s/%s: %w", check.CategoryVacuum, report.CheckID, err)
 	}
 
-	checkAutovacuumDisabled(rows, report)
+	checkAutovacuumDisabled(rows, c.autovacuumDisabledExcludes, report)
 	checkLargeTableDefaults(rows, report)
 	checkVacuumStale(rows, report)
 
@@ -98,10 +113,10 @@ func maxRowSeverity(rows []check.TableRow) check.Severity {
 	return severity
 }
 
-func checkAutovacuumDisabled(rows []db.TableVacuumHealthRow, report *check.Report) {
+func checkAutovacuumDisabled(rows []db.TableVacuumHealthRow, excludes []string, report *check.Report) {
 	var disabled []db.TableVacuumHealthRow
 	for _, row := range rows {
-		if hasAutovacuumDisabled(row.Reloptions.String) {
+		if row.AutovacuumDisabled.Bool && !isExcluded(row.TableName.String, excludes) {
 			disabled = append(disabled, row)
 		}
 	}
@@ -126,7 +141,7 @@ func checkAutovacuumDisabled(rows []db.TableVacuumHealthRow, report *check.Repor
 			Cells: []string{
 				row.TableName.String,
 				check.FormatNumber(row.EstimatedRows.Int64),
-				check.FormatBytes(row.TableSizeBytes.Int64),
+				formatSize(row.TableSizeBytes),
 				check.FormatNumber(row.NDeadTup.Int64),
 				formatActivity(row.LastVacuumAgeSeconds, row.VacuumCount.Int64+row.AutovacuumCount.Int64),
 			},
@@ -156,11 +171,14 @@ type largeDefaultEntry struct {
 func checkLargeTableDefaults(rows []db.TableVacuumHealthRow, report *check.Report) {
 	var entries []largeDefaultEntry
 	for _, row := range rows {
-		if row.EstimatedRows.Int64 >= largeTableMinRows && isUsingDefaultSettings(row.Reloptions.String) {
+		if row.VacuumTrigger.Valid &&
+			row.EstimatedRows.Int64 >= largeTableMinRows &&
+			isUsingDefaultSettings(row.Reloptions.String) &&
+			row.VacuumScaleFactor.Float64 >= defaultVacuumScaleFactor {
 			entries = append(entries, largeDefaultEntry{
 				row:     row,
-				trigger: defaultVacuumTrigger(row.EstimatedRows.Int64),
-				pending: row.NDeadTup.Int64 + row.NInsSinceVacuum.Int64,
+				trigger: row.VacuumTrigger.Int64,
+				pending: row.NDeadTup.Int64,
 			})
 		}
 	}
@@ -185,7 +203,7 @@ func checkLargeTableDefaults(rows []db.TableVacuumHealthRow, report *check.Repor
 			Cells: []string{
 				e.row.TableName.String,
 				check.FormatNumber(e.row.EstimatedRows.Int64),
-				check.FormatBytes(e.row.TableSizeBytes.Int64),
+				formatSize(e.row.TableSizeBytes),
 				check.FormatNumber(e.trigger),
 				check.FormatNumber(e.pending),
 				estNextVacuum(e.trigger, e.pending, e.row.LastVacuumAgeSeconds),
@@ -206,17 +224,12 @@ func checkLargeTableDefaults(rows []db.TableVacuumHealthRow, report *check.Repor
 	})
 }
 
-// defaultVacuumTrigger is the dead-tuple count default autovacuum waits for.
-func defaultVacuumTrigger(estimatedRows int64) int64 {
-	return int64(defaultVacuumScaleFactor*float64(estimatedRows)) + defaultVacuumThreshold
-}
-
 // estNextVacuum assumes dead tuples keep accumulating at their post-vacuum rate.
 func estNextVacuum(trigger, pending int64, lastVacuumAge pgtype.Int8) string {
 	if pending == 0 {
 		return noEstimate
 	}
-	if pending >= trigger {
+	if pending > trigger {
 		return "overdue"
 	}
 	if !lastVacuumAge.Valid || lastVacuumAge.Int64 <= 0 {
@@ -290,7 +303,7 @@ func checkVacuumStale(rows []db.TableVacuumHealthRow, report *check.Report) {
 			Cells: []string{
 				e.row.TableName.String,
 				check.FormatNumber(e.row.EstimatedRows.Int64),
-				check.FormatBytes(e.row.TableSizeBytes.Int64),
+				formatSize(e.row.TableSizeBytes),
 				check.FormatNumber(e.pendingWork),
 				formatActivity(e.lastVacuumAge, e.row.VacuumCount.Int64+e.row.AutovacuumCount.Int64),
 				formatActivity(e.lastAnalyzeAge, e.row.AnalyzeCount.Int64+e.row.AutoanalyzeCount.Int64),
@@ -344,10 +357,23 @@ func formatActivity(age pgtype.Int8, count int64) string {
 	return fmt.Sprintf("%s (%d)", formatAge(age.Int64), count)
 }
 
+// formatSize renders "-" for a relation without storage of its own.
+func formatSize(bytes pgtype.Int8) string {
+	if !bytes.Valid {
+		return "-"
+	}
+	return check.FormatBytes(bytes.Int64)
+}
+
 // Helper functions.
 
-func hasAutovacuumDisabled(reloptions string) bool {
-	return strings.Contains(strings.ToLower(reloptions), "autovacuum_enabled=false")
+func isExcluded(table string, prefixes []string) bool {
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(table, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func isUsingDefaultSettings(reloptions string) bool {

@@ -7,7 +7,7 @@ Detects queries on partitioned tables that don't use partition keys in their WHE
 - **pg_stat_statements >= 1.9** (PostgreSQL 14+) for query pattern analysis; older versions lack `pg_stat_statements_info` and the `toplevel` column
 - PostgreSQL 15+
 
-If `pg_stat_statements` is not installed, this check will report a WARNING and skip query pattern analysis. The sequential scan analysis will still run as it uses `pg_stat_user_tables` statistics.
+Without `pg_stat_statements`, query pattern analysis cannot run. The sequential scan analysis still runs, as it uses `pg_stat_user_tables` statistics.
 
 To enable the extension:
 
@@ -139,7 +139,7 @@ Just `SELECT`, `UPDATE`, `DELETE` and `WITH` statements are considered, matched 
 
 ### Query text visibility
 
-Only superusers and roles with `pg_read_all_stats` can read other users' query text; everyone else sees `<insufficient privilege>`. When any entry is hidden, the check reports `query-text-restricted` so a partial analysis is not mistaken for a clean bill of health.
+Only superusers and roles with `pg_read_all_stats` can read other users' query text; everyone else sees `<insufficient privilege>`. A statement with hidden text cannot be analyzed.
 
 ### Partition-leaf queries
 
@@ -147,13 +147,19 @@ Queries referencing a partition leaf directly (e.g. `orders_2025_01`) are not at
 
 ### Keys constrained through a JOIN
 
-The key counts as used when it is constrained anywhere after `FROM`, including a `JOIN ... ON` condition. Such a query prunes when the planner parameterizes the partitioned side (a nested loop) and does not prune when it hash joins, which cannot be told from the query text. The check treats it as used, preferring silence over reporting a table whose access path may well be pruning. Confirm an individual query with:
+The key counts as used when it is constrained anywhere after `FROM`, including a `JOIN ... ON` condition. Such a query prunes when the planner parameterizes the partitioned side (a nested loop) and does not prune when it hash joins, which cannot be told from the query text. The check treats it as used, preferring silence over reporting a table whose access path may well be pruning. To confirm an individual query, run `EXPLAIN` on the query text with a real value in place of each `$n` placeholder:
 
 ```sql
-EXPLAIN (GENERIC_PLAN, COSTS OFF) <query text with its $n placeholders>;  -- PostgreSQL 16+
+EXPLAIN (COSTS OFF) <query text with a real value for each $n>;
 ```
 
-`Subplans Removed: N` means pruning happens; all partitions listed means it does not.
+If the partitioned table is on the inner side of a `Nested Loop` and the key is in its index condition, the executor prunes at run time. The plan still lists every partition. If the plan uses a `Hash Join` and lists every partition, pruning does not happen.
+
+A real value can give a different plan from the plan that the application gets with parameters. Use values that are typical for the application.
+
+Do not use `EXPLAIN (GENERIC_PLAN)`. It has no values for the `$n` placeholders, so it cannot prune and always lists every partition.
+
+`EXPLAIN` takes a lock on the table, on every partition, and on every index. If DDL holds a lock on one of them, `EXPLAIN` waits, and DDL that comes after it waits too. Run `EXPLAIN` on a replica or at a quiet time.
 
 ### Subqueries and CTEs
 
@@ -239,3 +245,23 @@ For maintenance-oriented partitioning (data retention), you may accept query ove
 - Document the decision
 - Ensure indexes support the query patterns
 - Monitor query performance
+
+### For `extension-unavailable`
+
+Make `pg_stat_statements` 1.9 or later readable in the connected database:
+
+1. Add `pg_stat_statements` to `shared_preload_libraries` (on RDS, in the parameter group) and restart.
+2. Create the extension in a schema on the `search_path`, or update an old version:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+ALTER EXTENSION pg_stat_statements UPDATE;
+```
+
+### For `query-text-restricted`
+
+Grant `pg_read_all_stats` (or `pg_monitor`) to the role that runs pgdoctor, so the analysis covers every statement:
+
+```sql
+GRANT pg_read_all_stats TO pgdoctor_role;
+```

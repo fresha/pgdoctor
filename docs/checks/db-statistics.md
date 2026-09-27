@@ -1,4 +1,4 @@
-# Statistics Freshness
+# DB Statistics
 
 Validates that PostgreSQL runtime statistics are mature enough for accurate usage-based analysis.
 
@@ -18,9 +18,9 @@ is not evidence the counters are old. With no reset recorded the window is measu
 from server start instead, which is a lower bound: a clean restart preserves the
 counters (PG15+), and everything that zeroes them coincides with a start.
 
-That means a recently restarted server reports WARN even with no reset recorded —
-which is the point. It is the state where `index-usage` will report a busy index as
-having zero scans.
+That means a recently restarted server has young counters even with no reset
+recorded. It is the state where `index-usage` will report a busy index as having
+zero scans.
 
 ## Why Statistics Age Matters
 
@@ -69,7 +69,7 @@ Fresh statistics can cause:
 
 ## How to Fix
 
-### For `statistics-freshness`
+### For `db-statistics`
 
 Statistics-based checks require at least 7 days of accumulated data to reflect typical workload patterns.
 

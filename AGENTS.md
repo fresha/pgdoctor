@@ -38,6 +38,7 @@ type Checker interface {
 Each check package exports:
 - `Metadata()` function returning `check.Metadata`
 - `New(queryer)` constructor returning `check.Checker`
+- Optional: settings. See [Check Settings](#check-settings). A check without settings rejects every `--config` key.
 
 ### Check Structure
 
@@ -129,6 +130,39 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 }
 ```
 
+### Check Settings
+
+A check with settings exports a `Config` struct with `yaml` tags, `DefaultConfig()`, and `(Config) Validate() error`. Its constructor takes the `Config`:
+
+```go
+type Config struct {
+    WarnPercent float64  `yaml:"warn_percent"`
+    FailPercent float64  `yaml:"fail_percent"`
+    Exclude     []string `yaml:"exclude"`
+}
+
+func DefaultConfig() Config {
+    return Config{WarnPercent: 50, FailPercent: 90}
+}
+
+func (c Config) Validate() error {
+    if !(c.WarnPercent > 0 && c.WarnPercent < c.FailPercent) {
+        return fmt.Errorf("warn_percent %v must be positive and lower than fail_percent %v", c.WarnPercent, c.FailPercent)
+    }
+    return nil
+}
+
+func New(queryer MyQueryQueries, cfg Config) check.Checker {
+    return &checker{queryer: queryer, cfg: cfg}
+}
+```
+
+- The generator detects `DefaultConfig` and registers the check with a `DecodeConfig` in `AllChecks()`.
+- The CLI decodes the YAML section of the check over `DefaultConfig()`. It rejects an unknown key at any depth, then calls `Validate`.
+- A library caller puts the `Config` value in `check.Config`, keyed by check ID. `Run` calls `Validate`, and reports SKIP for an invalid value or a value of the wrong type.
+- Put every range rule and cross-field rule (for example warn < fail) in `Validate`. Never fall back to a default in silence.
+- Use real YAML types: numbers, lists (`[]string`), and maps (`map[string]T`). Never parse a comma-separated string.
+
 ### Report Structure (Field Promotion)
 
 Report embeds Metadata for direct field access:
@@ -198,18 +232,35 @@ report.AddFinding(check.Finding{
 })
 ```
 
+A check uses its own check ID as a finding ID only when that finding is the only finding in the report. The text output folds a single finding with the check ID into the check header. Next to other findings, it prints the check header twice.
+
+A finding `Name` can carry the headline value of the finding (for example `Cache Hit Ratio: 99.80%`), so the value is visible at every detail level and every severity. Put the explanation and the supporting values in `Details`. The text output shows the `Details` of a PASS finding only at `--detail verbose` and `--detail debug`.
+
 ### Filtering
 
 Filtering happens at the runner level (`pgdoctor.go`):
 - `--only check1,check2` - Only run specified checks
 - `--ignore check1,check2` - Skip specified checks
+- A filter value is a category, a check ID, `check-id/finding-id`, or `category/check-id[/finding-id]`, which is the form `pgdoctor list` prints
 - Checks don't need to implement filtering logic themselves
+
+### Exit Codes
+
+`pgdoctor run` uses the same exit codes for text and JSON output:
+
+| Code | Meaning |
+|------|---------|
+| `0` | The checks ran. No check reported FAIL. |
+| `1` | The checks ran. At least one check reported FAIL. |
+| `2` | pgdoctor could not run: connection error, usage error, bad `--config`, unknown flag value, or zero checks selected. |
+
+A check never sets the exit code. The CLI maps a FAIL finding to `1`. Any error that a command returns exits `2`.
 
 ### Statistics-Dependent Checks
 
 Some checks rely on PostgreSQL runtime statistics (`pg_stat_*` views):
 
-- Use the dedicated `statistics-freshness` check to validate stats maturity
+- Use the dedicated `db-statistics` check to validate stats maturity
 - Add a note in your README indicating the check depends on statistics
 - Avoid CROSS JOINs with `pg_stat_database` for stats age
 
@@ -236,7 +287,7 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 }
 ```
 
-Metadata is supplied by the caller through `check.ContextWithInstanceMetadata` and is never read from the database, so every field carries whatever the caller knew — the standalone CLI supplies none of it. `IsReadReplica` is `false` both for a primary and for a caller that never determined the role: scope a check off `true`, and never infer "this is a primary" from `false`. Aurora readers are cluster members that expose no RDS read-replica source, so they report `false` too.
+Metadata is supplied by the caller through `check.ContextWithInstanceMetadata`. When the caller supplies no `EngineVersionMajor`, the runner reads `server_version_num` from the database once and fills `EngineVersion`, `EngineVersionMajor`, and `EngineVersionMinor`. Caller metadata with a version wins. All other fields are caller-only and carry whatever the caller knew — the standalone CLI supplies none of them, so a check must treat a zero value (for example `MemoryGB`) as unknown. `IsReadReplica` is `false` both for a primary and for a caller that never determined the role: scope a check off `true`, and never infer "this is a primary" from `false`. Aurora readers are cluster members that expose no RDS read-replica source, so they report `false` too.
 
 ## SQL Query Conventions
 
@@ -275,8 +326,17 @@ All queries must be production-safe: read-only, no locks, < 1 second execution.
 
 - **CheckID**: kebab-case (`pg-version`, `invalid-indexes`)
 - **Directory**: single word or concatenated (`pgversion`, `invalidindexes`)
-- **Finding ID**: kebab-case for subchecks (`index-timestamp`, `single-table`)
+- **Finding ID**: kebab-case for subchecks (`index-timestamp`, `single-table`). Exception: a finding about one GUC uses the GUC name as its ID (`work_mem`, `autovacuum_max_workers`), so an operator can find the setting in `postgresql.conf` with the same string
 - **Consistency**: American English (`indexes` not `indices`)
+
+### Output Style
+
+These rules apply to table cells, finding names, and `Details`:
+
+- **Bytes**: use `check.FormatBytes`. It prints `512 bytes` below 1 KiB and IEC units above (`3.1MiB`). Write a fixed threshold in IEC units too (`>500MiB`). Never abbreviate bytes as `B` or `b`.
+- **Counts**: use `check.FormatNumber`. It prints `1.5K`, `47.5M`, `2.1B`.
+- **Missing value**: use `-` in a table cell. Use a word only when it carries more meaning than `-` (for example `never` for a vacuum that did not run).
+- **Object names**: always `schema.name`. Build the name in SQL: `(n.nspname || '.' || c.relname)::text`.
 
 ### Categories
 
@@ -297,12 +357,16 @@ Five categories:
 
 Report severity is automatically the maximum across all findings. `SeverityInfo` and `SeveritySkip` are ordered below `SeverityPass` so they don't affect severity comparisons.
 
+A `TableRow` can have a higher severity than its finding. A FAIL row under a WARN finding is intentional: the row color draws the eye to the worst object, and the finding severity, which drives the report severity and the exit code, stays at the level the check intends. Only the finding severity counts. Row severities never escalate the report.
+
 ### Presets
 
 The CLI groups checks into presets (defined in `internal/cli/presets.go`), selected with `--preset`:
 
 - `all` - every check (the default)
 - `triage` - the subset worth running during an active incident: runtime health and capacity signals (connection health/efficiency, replication lag/slots, table bloat, vacuum health, freeze age, invalid indexes, temp usage, cache efficiency) — not slow schema-design audits.
+
+A preset other than `all` takes precedence over `--only`: pgdoctor ignores `--only` and prints a warning to stderr. `--ignore` still removes checks from the preset. For an unknown preset, pgdoctor prints a warning that names the valid presets and uses `all`.
 
 When adding a check, ask: **is this useful during an active incident?** If yes, add its CheckID to `triageChecks` in `internal/cli/presets.go`. Schema-design and capacity-planning checks generally belong only in `all`.
 
@@ -477,7 +541,7 @@ pgdoctor.Run(ctx, conn, pgdoctor.Options{
 })
 ```
 
-Each contrib check creates its own sqlc queries internally, using the `check.DBTX` interface. This allows organizations to add domain-specific checks (naming conventions, internal standards) without forking.
+Each contrib check creates its own sqlc queries internally, using the `check.DBTX` interface. Its `check.Package.New` returns an error for an invalid entry in `check.Config`. A contrib check with settings also sets `DecodeConfig`, so the CLI can decode its YAML section. This allows organizations to add domain-specific checks (naming conventions, internal standards) without forking.
 
 ## Severity Assignment Guide
 

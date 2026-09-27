@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"sort"
@@ -21,9 +23,13 @@ func loadConfig(path string, checks []check.Package) (check.Config, error) {
 		return nil, fmt.Errorf("reading config: %w", err)
 	}
 
+	dec := yaml.NewDecoder(bytes.NewReader(data))
 	var raw map[string]yaml.Node
-	if err := yaml.Unmarshal(data, &raw); err != nil {
+	if err := dec.Decode(&raw); err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("parsing config %s: %w", path, err)
+	}
+	if err := dec.Decode(&yaml.Node{}); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("parsing config %s: expected one YAML document", path)
 	}
 
 	known := map[string]check.Package{}
@@ -45,6 +51,13 @@ func loadConfig(path string, checks []check.Package) (check.Config, error) {
 			}
 			continue
 		}
+		// Decode rejects an anchor that contains itself and excessive aliasing.
+		// resolveAliases does not stop on the first and expands the second in full.
+		if err := node.Decode(new(any)); err != nil {
+			problems = append(problems, fmt.Sprintf("%s: %v", checkID, err))
+			continue
+		}
+		resolveAliases(&node)
 		settings, err := yaml.Marshal(&node)
 		if err != nil {
 			problems = append(problems, fmt.Sprintf("%s: %v", checkID, err))
@@ -70,4 +83,13 @@ func loadConfig(path string, checks []check.Package) (check.Config, error) {
 		return nil, fmt.Errorf("invalid config %s:\n  %s", path, strings.Join(problems, "\n  "))
 	}
 	return cfg, nil
+}
+
+func resolveAliases(n *yaml.Node) {
+	if n.Kind == yaml.AliasNode {
+		*n = *n.Alias
+	}
+	for _, child := range n.Content {
+		resolveAliases(child)
+	}
 }

@@ -80,6 +80,12 @@ go build -o pgdoctor ./cmd/pgdoctor
 go test ./...
 ```
 
+## Changelog
+
+Every PR adds a changelog fragment with `changie new` (`brew install changie`).
+Never edit `CHANGELOG.md` in a PR. See [AGENTS.md](AGENTS.md) for the release procedure.
+In this fork, send fixes to [emancu/pgdoctor](https://github.com/emancu/pgdoctor); only an upstream import PR edits `CHANGELOG.md` here.
+
 ## Severity Philosophy
 
 Choose severity carefully — it determines how users prioritize their work:

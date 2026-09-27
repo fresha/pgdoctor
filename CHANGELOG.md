@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-09-27
+
+Tracks upstream [emancu/pgdoctor v0.6.1](https://github.com/emancu/pgdoctor/releases/tag/v0.6.1).
+
+### Fixed
+
+- **CLI**: a `--config` file with more than one YAML document is a config error (exit 2). Only the first document was read, so settings after a `---` had no effect ([#193](https://github.com/emancu/pgdoctor/pull/193)).
+- **CLI**: a `--config` alias to an anchor in another check section works. It failed with "unknown anchor" ([#195](https://github.com/emancu/pgdoctor/pull/195)).
+
 ## [0.10.0] - 2026-09-27
 
 Tracks upstream [emancu/pgdoctor v0.6.0](https://github.com/emancu/pgdoctor/releases/tag/v0.6.0): typed per-check config, new `run` exit codes, re-tiered severities, and two renamed IDs. This release has breaking changes.

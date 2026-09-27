@@ -14,7 +14,9 @@ import (
 	"github.com/fresha/pgdoctor"
 	"github.com/fresha/pgdoctor/check"
 	"github.com/fresha/pgdoctor/checks/partitioning"
+	"github.com/fresha/pgdoctor/checks/pktypes"
 	"github.com/fresha/pgdoctor/checks/replicationlag"
+	"github.com/fresha/pgdoctor/checks/sequencehealth"
 	"github.com/fresha/pgdoctor/checks/sessionsettings"
 	"github.com/fresha/pgdoctor/checks/tablevacuumhealth"
 	"github.com/fresha/pgdoctor/db"
@@ -46,6 +48,11 @@ func TestLoadConfig(t *testing.T) {
 			want:    check.Config{},
 		},
 		{
+			name:    "one document with markers",
+			content: "---\nsession-settings:\n  timeout: 1000\n...\n",
+			want:    check.Config{"session-settings": sessionsettings.Config{Timeout: 1000}},
+		},
+		{
 			name:    "check without settings",
 			content: "pg-version: {}\n",
 			want:    check.Config{},
@@ -75,6 +82,34 @@ func TestLoadConfig(t *testing.T) {
 				PhysicalLagFailSeconds:   60,
 				PhysicalLagByApplication: map[string]replicationlag.LagThresholds{"delayed": {WarnSeconds: 305, FailSeconds: 360}},
 			}},
+		},
+		{
+			name:    "alias across sections",
+			content: "pk-types: &limits\n  usage_warn_percent: 40\nsequence-health: *limits\n",
+			want: check.Config{
+				"pk-types":        pktypes.Config{UsageWarnPercent: 40, UsageFailPercent: 90},
+				"sequence-health": sequencehealth.Config{UsageWarnPercent: 40, UsageFailPercent: 90},
+			},
+		},
+		{
+			name:    "alias inside one section",
+			content: "replication-lag:\n  physical_lag_by_application:\n    a: &lag {warn_seconds: 305, fail_seconds: 360}\n    b: *lag\n",
+			want: check.Config{"replication-lag": replicationlag.Config{
+				PhysicalLagWarnSeconds: 5,
+				PhysicalLagFailSeconds: 60,
+				PhysicalLagByApplication: map[string]replicationlag.LagThresholds{
+					"a": {WarnSeconds: 305, FailSeconds: 360},
+					"b": {WarnSeconds: 305, FailSeconds: 360},
+				},
+			}},
+		},
+		{
+			name:    "merge key with an explicit key that wins",
+			content: "pk-types: &limits\n  usage_warn_percent: 40\n  usage_fail_percent: 80\nsequence-health:\n  usage_warn_percent: 30\n  <<: *limits\n",
+			want: check.Config{
+				"pk-types":        pktypes.Config{UsageWarnPercent: 40, UsageFailPercent: 80},
+				"sequence-health": sequencehealth.Config{UsageWarnPercent: 30, UsageFailPercent: 80},
+			},
 		},
 	}
 
@@ -163,6 +198,27 @@ func TestLoadConfigInvalid(t *testing.T) {
 				`unknown check "no-such-check"`,
 			},
 		},
+		{
+			name:    "unknown key through an alias",
+			content: "pk-types: &limits\n  usage_warn_percnt: 40\nsequence-health: *limits\n",
+			want: []string{
+				"pk-types: field usage_warn_percnt not found in type pktypes.Config",
+				"sequence-health: field usage_warn_percnt not found in type sequencehealth.Config",
+			},
+		},
+		{
+			name:    "unknown key through a merge key",
+			content: "replication-lag:\n  physical_lag_by_application:\n    a: &lag {warn_seconds: 305, fial_seconds: 360}\n    b:\n      <<: *lag\n",
+			want: []string{
+				"replication-lag: field fial_seconds not found in type replicationlag.LagThresholds",
+				"replication-lag: field fial_seconds not found in type replicationlag.LagThresholds",
+			},
+		},
+		{
+			name:    "anchor that contains itself",
+			content: "pk-types: &limits\n  usage_warn_percent: *limits\n",
+			want:    []string{"pk-types: yaml: anchor 'limits' value contains itself"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -195,6 +251,31 @@ func TestLoadConfigInvalidYAML(t *testing.T) {
 	_, err := loadConfig(writeConfig(t, "session-settings: [\n"), pgdoctor.AllChecks())
 
 	require.ErrorContains(t, err, "parsing config")
+}
+
+func TestLoadConfigMultipleDocuments(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{name: "two documents", content: "session-settings:\n  timeout: 1000\n---\npk-types:\n  usage_warn_percent: 40\n"},
+		{name: "unknown key in the second document", content: "session-settings:\n  timeout: 1000\n---\nsession-settings:\n  timeuot: 1\n"},
+		{name: "empty second document", content: "session-settings:\n  timeout: 1000\n---\n"},
+		{name: "invalid second document", content: "session-settings:\n  timeout: 1000\n---\nsession-settings: [\n"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg, err := loadConfig(writeConfig(t, tt.content), pgdoctor.AllChecks())
+
+			require.ErrorContains(t, err, "expected one YAML document")
+			assert.Nil(t, cfg)
+		})
+	}
 }
 
 type sessionSettingsQueryer []db.SessionSettingsRow

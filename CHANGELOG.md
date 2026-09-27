@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-27
+
+Tracks upstream [emancu/pgdoctor v0.7.0](https://github.com/emancu/pgdoctor/releases/tag/v0.7.0).
+
+### Added
+
+- **Config**: `pgdoctor.LoadConfig` reads a config file, with the same validation as the `--config` flag ([#207](https://github.com/emancu/pgdoctor/pull/207)).
+
+### Changed
+
+- **table-vacuum-health**: `ignore_tables` now removes a table from every finding of the check, not only from `autovacuum-disabled` ([#206](https://github.com/emancu/pgdoctor/pull/206)).
+
 ## [0.10.1] - 2026-09-27
 
 Tracks upstream [emancu/pgdoctor v0.6.3](https://github.com/emancu/pgdoctor/releases/tag/v0.6.3).

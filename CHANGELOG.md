@@ -9,10 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.10.1] - 2026-09-27
 
-Tracks upstream [emancu/pgdoctor v0.6.1](https://github.com/emancu/pgdoctor/releases/tag/v0.6.1).
+Tracks upstream [emancu/pgdoctor v0.6.2](https://github.com/emancu/pgdoctor/releases/tag/v0.6.2).
 
 ### Fixed
 
+- **CLI**: a `--config` alias cycle or alias bomb inside a merge key is a config error (exit 2). It crashed pgdoctor with a stack overflow ([#199](https://github.com/emancu/pgdoctor/pull/199)).
 - **CLI**: a `--config` file with more than one YAML document is a config error (exit 2). Only the first document was read, so settings after a `---` had no effect ([#193](https://github.com/emancu/pgdoctor/pull/193)).
 - **CLI**: a `--config` alias to an anchor in another check section works. It failed with "unknown anchor" ([#195](https://github.com/emancu/pgdoctor/pull/195)).
 

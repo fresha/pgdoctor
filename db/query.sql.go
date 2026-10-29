@@ -2320,6 +2320,49 @@ func (q *Queries) SessionStatistics(ctx context.Context) (SessionStatisticsRow, 
 	return i, err
 }
 
+const statementStatsWindows = `-- name: StatementStatsWindows :many
+SELECT
+  queryid::bigint AS query_id
+  , extract(EPOCH FROM (now() - MIN(stats_since)))::bigint AS window_seconds
+FROM pg_stat_statements
+WHERE
+  dbid = (SELECT d.oid FROM pg_database AS d WHERE d.datname = current_database())
+  AND toplevel
+  AND queryid = ANY($1::bigint [])
+GROUP BY queryid
+`
+
+type StatementStatsWindowsRow struct {
+	QueryID       pgtype.Int8
+	WindowSeconds pgtype.Int8
+}
+
+// How long each statement's counters have been accumulating. stats_since needs
+// pg_stat_statements 1.11 (PostgreSQL 17): before it, the only window is the
+// last reset of the whole view, which overstates the window of every statement
+// first seen since. QueryStatsFromStatStatements returns one row per entry
+// without the user, so this takes a queryid's oldest entry, which can only
+// understate a newer entry's daily cost.
+func (q *Queries) StatementStatsWindows(ctx context.Context, queryIds []int64) ([]StatementStatsWindowsRow, error) {
+	rows, err := q.db.Query(ctx, statementStatsWindows, queryIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []StatementStatsWindowsRow
+	for rows.Next() {
+		var i StatementStatsWindowsRow
+		if err := rows.Scan(&i.QueryID, &i.WindowSeconds); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const tableActivity = `-- name: TableActivity :many
 SELECT
   (schemaname || '.' || relname)::text AS table_name

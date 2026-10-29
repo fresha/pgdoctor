@@ -178,3 +178,20 @@ FROM (
 ) AS by_calls
 
 ORDER BY total_exec_time DESC;
+
+-- name: StatementStatsWindows :many
+-- How long each statement's counters have been accumulating. stats_since needs
+-- pg_stat_statements 1.11 (PostgreSQL 17): before it, the only window is the
+-- last reset of the whole view, which overstates the window of every statement
+-- first seen since. QueryStatsFromStatStatements returns one row per entry
+-- without the user, so this takes a queryid's oldest entry, which can only
+-- understate a newer entry's daily cost.
+SELECT
+  queryid::bigint AS query_id
+  , extract(EPOCH FROM (now() - MIN(stats_since)))::bigint AS window_seconds
+FROM pg_stat_statements
+WHERE
+  dbid = (SELECT d.oid FROM pg_database AS d WHERE d.datname = current_database())
+  AND toplevel
+  AND queryid = ANY(@query_ids::bigint [])
+GROUP BY queryid;

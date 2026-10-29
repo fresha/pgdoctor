@@ -5,6 +5,7 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 
@@ -27,10 +28,32 @@ type PartitionUsageQueries interface {
 	HiddenQueryTextCount(context.Context) (pgtype.Int8, error)
 	PartitionedTablesWithKeys(context.Context) ([]db.PartitionedTablesWithKeysRow, error)
 	QueryStatsFromStatStatements(context.Context) ([]db.QueryStatsFromStatStatementsRow, error)
+	StatementStatsWindows(context.Context, []int64) ([]db.StatementStatsWindowsRow, error)
+}
+
+type Config struct {
+	// ExecTimeFailMinutesPerDay is the daily execution time a table's
+	// unprunable statements need before the call and total-time thresholds can
+	// FAIL it. Those count everything since the counters began, so on their own
+	// they keep failing a table whose statements cost seconds a day. 0 leaves
+	// the cumulative thresholds to decide alone.
+	ExecTimeFailMinutesPerDay float64 `yaml:"exec_time_fail_minutes_per_day"`
+}
+
+func DefaultConfig() Config {
+	return Config{ExecTimeFailMinutesPerDay: 5}
+}
+
+func (c Config) Validate() error {
+	if !(c.ExecTimeFailMinutesPerDay >= 0) || math.IsInf(c.ExecTimeFailMinutesPerDay, 1) {
+		return fmt.Errorf("exec_time_fail_minutes_per_day: %v is not a non-negative number", c.ExecTimeFailMinutesPerDay)
+	}
+	return nil
 }
 
 type checker struct {
-	queries PartitionUsageQueries
+	queries              PartitionUsageQueries
+	execTimePerDayFailMs float64
 }
 
 func Metadata() check.Metadata {
@@ -44,9 +67,10 @@ func Metadata() check.Metadata {
 	}
 }
 
-func New(queries PartitionUsageQueries) check.Checker {
+func New(queries PartitionUsageQueries, cfg Config) check.Checker {
 	return &checker{
-		queries: queries,
+		queries:              queries,
+		execTimePerDayFailMs: cfg.ExecTimeFailMinutesPerDay * 60_000,
 	}
 }
 
@@ -60,6 +84,11 @@ const (
 	minCallsFail        = int64(1000)
 	totalExecTimeWarnMs = float64(300_000)  // 5 minutes
 	totalExecTimeFailMs = float64(3600_000) // 1 hour
+
+	// minRateWindowSeconds keeps a statement seen for minutes from turning a
+	// short burst into a daily rate.
+	minRateWindowSeconds = secondsPerDay
+	secondsPerDay        = int64(24 * 60 * 60)
 
 	// Sequential scan thresholds.
 	minSeqScansWarn   = int64(1000)
@@ -141,18 +170,102 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 			Severity: check.SeveritySkip,
 			Details:  "No query statistics available (pg_stat_statements may be empty)",
 		})
-	} else {
-		checkPartitionKeyUsage(partitionedTables, queryStats, report)
-		checkJoinsMissingPartitionKey(partitionedTables, queryStats, report)
+
+		return report, nil
 	}
 
+	windows, err := c.statementWindows(ctx, queryStats)
+	if err != nil {
+		return nil, fmt.Errorf("querying pg_stat_statements windows: %w", err)
+	}
+
+	checkPartitionKeyUsage(partitionedTables, queryStats, windows, c.execTimePerDayFailMs, report)
+	checkJoinsMissingPartitionKey(partitionedTables, queryStats, windows, c.execTimePerDayFailMs, report)
+
 	return report, nil
+}
+
+// statementWindows reads how long each statement's counters have been
+// accumulating. PostgreSQL 16 and older record no start per statement, so every
+// statement falls back to the last reset of the whole view.
+func (c *checker) statementWindows(ctx context.Context, queries []db.QueryStatsFromStatStatementsRow) (rateWindows, error) {
+	windows := rateWindows{fallback: statsAge(queries)}
+
+	meta := check.InstanceMetadataFromContext(ctx)
+	if meta == nil || meta.EngineVersionMajor < 17 {
+		return windows, nil
+	}
+
+	ids := make([]int64, 0, len(queries))
+	for _, q := range queries {
+		ids = append(ids, q.QueryID.Int64)
+	}
+
+	rows, err := c.queries.StatementStatsWindows(ctx, ids)
+	if err != nil {
+		return rateWindows{}, err
+	}
+
+	windows.byQueryID = make(map[int64]int64, len(rows))
+	for _, row := range rows {
+		if row.WindowSeconds.Valid {
+			windows.byQueryID[row.QueryID.Int64] = row.WindowSeconds.Int64
+		}
+	}
+
+	return windows, nil
+}
+
+// rateWindows turns a statement's cumulative execution time into time per day.
+type rateWindows struct {
+	byQueryID map[int64]int64
+	// fallback is the age of the last reset of the whole view.
+	fallback pgtype.Int8
+}
+
+// perDayMs returns a statement's execution time per day over its window, and
+// false when no window is known.
+func (w rateWindows) perDayMs(queryID int64, execTimeMs float64) (float64, bool) {
+	seconds, ok := w.byQueryID[queryID]
+	if !ok {
+		if !w.fallback.Valid {
+			return 0, false
+		}
+		seconds = w.fallback.Int64
+	}
+
+	return execTimeMs * float64(secondsPerDay) / float64(max(seconds, minRateWindowSeconds)), true
+}
+
+// dailyTime is a table's execution time per day on unprunable statements. It
+// is known only when the window of every statement is.
+type dailyTime struct {
+	ms    float64
+	known bool
+}
+
+func (d *dailyTime) add(ms float64, ok bool) {
+	d.ms += ms
+	d.known = d.known && ok
+}
+
+// isCritical reports whether a table's unprunable workload FAILs: it must cross
+// a cumulative threshold and, when its daily time is known, cost at least
+// perDayFailMs a day.
+func isCritical(calls int64, execTime float64, perDay dailyTime, perDayFailMs float64) bool {
+	if calls < minCallsFail && execTime < totalExecTimeFailMs {
+		return false
+	}
+
+	return !perDay.known || perDay.ms >= perDayFailMs
 }
 
 // checkPartitionKeyUsage analyzes queries to find those not using partition keys.
 func checkPartitionKeyUsage(
 	tables []db.PartitionedTablesWithKeysRow,
 	queries []db.QueryStatsFromStatStatementsRow,
+	windows rateWindows,
+	perDayFailMs float64,
 	report *check.Report,
 ) {
 	var affected []affectedTable
@@ -172,6 +285,7 @@ func checkPartitionKeyUsage(
 		var found []problemQuery
 		var totalCalls int64
 		var totalExecTime float64
+		perDay := dailyTime{known: true}
 
 		for _, q := range queries {
 			if !queryReferencesTable(q.Query.String, schemaName, tableName) {
@@ -184,6 +298,7 @@ func checkPartitionKeyUsage(
 				if calls >= minCallsWarn || execTime >= totalExecTimeWarnMs {
 					totalCalls += calls
 					totalExecTime += execTime
+					perDay.add(windows.perDayMs(q.QueryID.Int64, execTime))
 					found = append(found, problemQuery{
 						table:    qualifiedName,
 						calls:    calls,
@@ -202,7 +317,7 @@ func checkPartitionKeyUsage(
 		// Severity is a property of the table's whole workload, not of any single
 		// statement, so every one of its rows carries the table's severity.
 		severity := check.SeverityWarn
-		if totalCalls >= minCallsFail || totalExecTime >= totalExecTimeFailMs {
+		if isCritical(totalCalls, totalExecTime, perDay, perDayFailMs) {
 			severity = check.SeverityFail
 			hasCritical = true
 		}
@@ -219,6 +334,7 @@ func checkPartitionKeyUsage(
 			statements:    len(found),
 			calls:         totalCalls,
 			execTime:      totalExecTime,
+			perDay:        perDay,
 		})
 	}
 
@@ -285,6 +401,7 @@ type affectedTable struct {
 	statements    int
 	calls         int64
 	execTime      float64
+	perDay        dailyTime
 }
 
 // problemQuery is one statement that does not constrain its table's partition key.
@@ -309,6 +426,10 @@ func problemDetails(affected []affectedTable, statements int, statsAgeSeconds pg
 		fmt.Fprintf(&b, "\n  %s (key: %s, %d partitions) — %d statement(s), %s calls, %s",
 			table.qualifiedName, table.partitionKeys, table.partitions, table.statements,
 			check.FormatNumber(table.calls), check.FormatDurationMs(table.execTime))
+
+		if table.perDay.known {
+			fmt.Fprintf(&b, ", %s/day", check.FormatDurationMs(table.perDay.ms))
+		}
 	}
 
 	return b.String()
@@ -738,6 +859,8 @@ func hasComparisonBefore(text string, mode operatorMode) bool {
 func checkJoinsMissingPartitionKey(
 	tables []db.PartitionedTablesWithKeysRow,
 	queries []db.QueryStatsFromStatStatementsRow,
+	windows rateWindows,
+	perDayFailMs float64,
 	report *check.Report,
 ) {
 	var tableRows []check.TableRow
@@ -755,6 +878,7 @@ func checkJoinsMissingPartitionKey(
 		var problemJoinCount int
 		var totalCalls int64
 		var totalExecTime float64
+		perDay := dailyTime{known: true}
 
 		for _, q := range queries {
 			// Only check queries with JOINs that reference this table.
@@ -774,15 +898,21 @@ func checkJoinsMissingPartitionKey(
 					problemJoinCount++
 					totalCalls += calls
 					totalExecTime += execTime
+					perDay.add(windows.perDayMs(q.QueryID.Int64, execTime))
 				}
 			}
 		}
 
 		if problemJoinCount > 0 {
 			severity := check.SeverityWarn
-			if totalCalls >= minCallsFail || totalExecTime >= totalExecTimeFailMs {
+			if isCritical(totalCalls, totalExecTime, perDay, perDayFailMs) {
 				severity = check.SeverityFail
 				hasCritical = true
+			}
+
+			timePerDay := "-"
+			if perDay.known {
+				timePerDay = check.FormatDurationMs(perDay.ms)
 			}
 
 			tableRows = append(tableRows, check.TableRow{
@@ -792,6 +922,7 @@ func checkJoinsMissingPartitionKey(
 					fmt.Sprintf("%d", problemJoinCount),
 					fmt.Sprintf("%d", totalCalls),
 					check.FormatDurationMs(totalExecTime),
+					timePerDay,
 				},
 				Severity: severity,
 			})
@@ -818,7 +949,7 @@ func checkJoinsMissingPartitionKey(
 		Severity: overallSeverity,
 		Details:  fmt.Sprintf("Found %d partitioned table(s) with JOINs not using partition key", len(tableRows)),
 		Table: &check.Table{
-			Headers: []string{"Table", "Partition Key", "Problem JOINs", "Total Calls", "Total Time"},
+			Headers: []string{"Table", "Partition Key", "Problem JOINs", "Total Calls", "Total Time", "Time/Day"},
 			Rows:    tableRows,
 		},
 	})

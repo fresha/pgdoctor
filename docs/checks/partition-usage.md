@@ -46,7 +46,9 @@ SELECT query FROM pg_stat_statements WHERE queryid = <Query ID>;
 
 **Thresholds** apply to a table's whole unprunable workload, not to individual statements, and every row of a table carries that table's severity:
 - Warning: >100 calls without partition key, OR total execution time >5 minutes
-- Critical: >1000 calls without partition key, OR total execution time >1 hour
+- Critical: >1000 calls without partition key, OR total execution time >1 hour, AND at least 5 minutes of execution time a day (see [Configuration](#configuration))
+
+The call and total-time counts are cumulative, so on their own they keep a table critical for statements that cost seconds a day. The daily time is each statement's total divided by how long its counters have been accumulating, summed per table and shown after the table's totals. From PostgreSQL 17 that is the statement's own `stats_since`; before it, the last reset of `pg_stat_statements`, which understates the daily time of statements first seen since. Any window shorter than a day counts as a day, so a burst from a statement seen for minutes is not read as a daily rate. When no window is known, the cumulative thresholds decide alone.
 
 ### high-seq-scan-ratio
 
@@ -66,7 +68,7 @@ Identifies JOINs on partitioned tables that don't include the partition key in t
 
 **Thresholds:**
 - Warning: >100 calls with JOIN missing partition key, OR total execution time >5 minutes
-- Critical: >1000 calls with JOIN missing partition key, OR total execution time >1 hour
+- Critical: >1000 calls with JOIN missing partition key, OR total execution time >1 hour, AND the same daily execution time as `partition-key-unused`, worked out the same way and shown in the Time/Day column
 
 **Example:**
 ```sql
@@ -81,6 +83,29 @@ JOIN orders o ON o.customer_id = c.id;
 SELECT * FROM customers c
 JOIN orders o ON o.customer_id = c.id
 WHERE o.created_at > '2024-01-01';
+```
+
+## Configuration
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `exec_time_fail_minutes_per_day` | Execution time a day, in minutes, that a table's unprunable statements need before `partition-key-unused` or `join-missing-partition-key` can FAIL it | `5` |
+
+A negative or infinite value is an error. `0` turns the daily rule off, so the call and total-time thresholds decide alone.
+
+```yaml
+partition-usage:
+  exec_time_fail_minutes_per_day: 15
+```
+
+As a library, pass a `partitionusage.Config` in `check.Config`:
+
+```go
+cfg := partitionusage.Config{ExecTimeFailMinutesPerDay: 15}
+pgdoctor.Run(ctx, conn, pgdoctor.Options{
+    Checks: pgdoctor.AllChecks(),
+    Config: check.Config{"partition-usage": cfg},
+})
 ```
 
 ## Limitations

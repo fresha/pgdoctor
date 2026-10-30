@@ -411,6 +411,28 @@ func (q *Queries) HasPgStatStatements(ctx context.Context) (pgtype.Bool, error) 
 	return column_1, err
 }
 
+const hasStatsSince = `-- name: HasStatsSince :one
+SELECT EXISTS (
+  SELECT 1
+  FROM pg_catalog.pg_attribute AS a
+  WHERE
+    a.attrelid = to_regclass('pg_stat_statements')
+    AND a.attname = 'stats_since'
+    AND NOT a.attisdropped
+)
+`
+
+// stats_since arrives with pg_stat_statements 1.11, not with a server version:
+// a major upgrade leaves the extension at its old version until ALTER
+// EXTENSION ... UPDATE, so the column itself is the test. extversion would
+// need a numeric comparison, since '1.9' > '1.11' as text.
+func (q *Queries) HasStatsSince(ctx context.Context) (bool, error) {
+	row := q.db.QueryRow(ctx, hasStatsSince)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const hiddenQueryTextCount = `-- name: HiddenQueryTextCount :one
 SELECT COUNT(*)::bigint
 FROM pg_stat_statements
@@ -2324,7 +2346,7 @@ const statementStatsWindows = `-- name: StatementStatsWindows :many
 SELECT
   queryid::bigint AS query_id
   , extract(EPOCH FROM (now() - MIN(stats_since)))::bigint AS window_seconds
-FROM pg_stat_statements
+FROM pg_stat_statements(false)
 WHERE
   dbid = (SELECT d.oid FROM pg_database AS d WHERE d.datname = current_database())
   AND toplevel
@@ -2337,12 +2359,13 @@ type StatementStatsWindowsRow struct {
 	WindowSeconds pgtype.Int8
 }
 
-// How long each statement's counters have been accumulating. stats_since needs
-// pg_stat_statements 1.11 (PostgreSQL 17): before it, the only window is the
+// How long each statement's counters have been accumulating. Before
+// pg_stat_statements 1.11 there is no stats_since, and the only window is the
 // last reset of the whole view, which overstates the window of every statement
 // first seen since. QueryStatsFromStatStatements returns one row per entry
 // without the user, so this takes a queryid's oldest entry, which can only
-// understate a newer entry's daily cost.
+// understate a newer entry's daily cost. pg_stat_statements(false) skips the
+// query-text file, which nothing here reads.
 func (q *Queries) StatementStatsWindows(ctx context.Context, queryIds []int64) ([]StatementStatsWindowsRow, error) {
 	rows, err := q.db.Query(ctx, statementStatsWindows, queryIds)
 	if err != nil {

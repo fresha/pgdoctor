@@ -28,6 +28,7 @@ type PartitionUsageQueries interface {
 	HiddenQueryTextCount(context.Context) (pgtype.Int8, error)
 	PartitionedTablesWithKeys(context.Context) ([]db.PartitionedTablesWithKeysRow, error)
 	QueryStatsFromStatStatements(context.Context) ([]db.QueryStatsFromStatStatementsRow, error)
+	HasStatsSince(context.Context) (bool, error)
 	StatementStatsWindows(context.Context, []int64) ([]db.StatementStatsWindowsRow, error)
 }
 
@@ -186,13 +187,17 @@ func (c *checker) Check(ctx context.Context) (*check.Report, error) {
 }
 
 // statementWindows reads how long each statement's counters have been
-// accumulating. PostgreSQL 16 and older record no start per statement, so every
-// statement falls back to the last reset of the whole view.
+// accumulating. pg_stat_statements before 1.11 records no start per statement,
+// so every statement falls back to the last reset of the whole view.
 func (c *checker) statementWindows(ctx context.Context, queries []db.QueryStatsFromStatStatementsRow) (rateWindows, error) {
 	windows := rateWindows{fallback: statsAge(queries)}
 
-	meta := check.InstanceMetadataFromContext(ctx)
-	if meta == nil || meta.EngineVersionMajor < 17 {
+	hasStatsSince, err := c.queries.HasStatsSince(ctx)
+	if err != nil {
+		return rateWindows{}, err
+	}
+
+	if !hasStatsSince {
 		return windows, nil
 	}
 
@@ -223,41 +228,56 @@ type rateWindows struct {
 	fallback pgtype.Int8
 }
 
-// perDayMs returns a statement's execution time per day over its window, and
-// false when no window is known.
-func (w rateWindows) perDayMs(queryID int64, execTimeMs float64) (float64, bool) {
+// perDayMs returns a statement's execution time per day over its window. known
+// is false when no window is known. lowerBound is true when the window is the
+// last reset of the whole view, which overstates the window of a statement
+// first seen since, or of an entry evicted or reset on its own since.
+func (w rateWindows) perDayMs(queryID int64, execTimeMs float64) (ms float64, known, lowerBound bool) {
 	seconds, ok := w.byQueryID[queryID]
 	if !ok {
 		if !w.fallback.Valid {
-			return 0, false
+			return 0, false, false
 		}
 		seconds = w.fallback.Int64
 	}
 
-	return execTimeMs * float64(secondsPerDay) / float64(max(seconds, minRateWindowSeconds)), true
+	return execTimeMs * float64(secondsPerDay) / float64(max(seconds, minRateWindowSeconds)), true, !ok
 }
 
 // dailyTime is a table's execution time per day on unprunable statements. It
-// is known only when the window of every statement is.
+// is known only when the window of every statement is, and a lower bound when
+// any statement's window is the last reset of the whole view.
 type dailyTime struct {
-	ms    float64
-	known bool
+	ms         float64
+	known      bool
+	lowerBound bool
 }
 
-func (d *dailyTime) add(ms float64, ok bool) {
+func (d *dailyTime) add(ms float64, known, lowerBound bool) {
 	d.ms += ms
-	d.known = d.known && ok
+	d.known = d.known && known
+	d.lowerBound = d.lowerBound || lowerBound
+}
+
+// String formats the daily time, marking a lower bound with "≥".
+func (d dailyTime) String() string {
+	if d.lowerBound {
+		return "≥" + check.FormatDurationMs(d.ms)
+	}
+
+	return check.FormatDurationMs(d.ms)
 }
 
 // isCritical reports whether a table's unprunable workload FAILs: it must cross
-// a cumulative threshold and, when its daily time is known, cost at least
-// perDayFailMs a day.
+// a cumulative threshold and cost at least perDayFailMs a day. A daily time
+// that is unknown or only a lower bound cannot show the table is under that,
+// so the cumulative thresholds decide alone.
 func isCritical(calls int64, execTime float64, perDay dailyTime, perDayFailMs float64) bool {
 	if calls < minCallsFail && execTime < totalExecTimeFailMs {
 		return false
 	}
 
-	return !perDay.known || perDay.ms >= perDayFailMs
+	return !perDay.known || perDay.lowerBound || perDay.ms >= perDayFailMs
 }
 
 // checkPartitionKeyUsage analyzes queries to find those not using partition keys.
@@ -428,7 +448,7 @@ func problemDetails(affected []affectedTable, statements int, statsAgeSeconds pg
 			check.FormatNumber(table.calls), check.FormatDurationMs(table.execTime))
 
 		if table.perDay.known {
-			fmt.Fprintf(&b, ", %s/day", check.FormatDurationMs(table.perDay.ms))
+			fmt.Fprintf(&b, ", %s/day", table.perDay)
 		}
 	}
 
@@ -912,7 +932,7 @@ func checkJoinsMissingPartitionKey(
 
 			timePerDay := "-"
 			if perDay.known {
-				timePerDay = check.FormatDurationMs(perDay.ms)
+				timePerDay = perDay.String()
 			}
 
 			tableRows = append(tableRows, check.TableRow{
